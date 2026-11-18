@@ -7,3 +7,7 @@ Programs Used:
 Claude AI
 Deepseek
 ChatGPT
+Gemini
+
+https://github.com/JonnyWalker/PySNES
+https://github.com/nesdev-org/MesenCE

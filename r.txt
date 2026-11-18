@@ -3,3 +3,4 @@ python3.16 -m pip install --no-build-isolation pymunk==6.9.0
 python3.16 -m pip install arcade
 python3.16 -m pip install numpy
 python3.16 -m pip install sounddevice
+pip install arcade numpy imageio imageio-ffmpeg sounddevice
