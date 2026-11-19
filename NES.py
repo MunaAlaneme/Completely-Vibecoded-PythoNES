@@ -3806,7 +3806,9 @@ class GameBoy:
             self.wram[(addr - 0xE000) & 0x1FFF] = val
         elif addr < 0xFEA0:
             self.oam[addr - 0xFE00] = val
-        elif 0xFF00 <= addr < 0xFF80:
+        elif addr < 0xFF00:
+            pass
+        elif addr < 0xFF80:
             r = addr & 0x7F
             self.io[r] = val
             if r == 0x04:
