@@ -8113,8 +8113,8 @@ out vec4 fragColor;
 void main() { fragColor = vec4(color.rgb + vec3(uv, 0.0) * zero, color.a); }
 """
 
-MENU_H = 24
-ITEM_H = 23
+MENU_H = 28
+ITEM_H = 25
 SEP_H = 9
 PAD_X = 12
 CHECK_W = 22
@@ -8891,7 +8891,11 @@ class RetroWindow(arcade.Window if arcade else object):
             if sx0 + sw > ww:
                 sx0 = ref_geo["x0"] - sw + 1
             total_h = sum(SEP_H if s is None else ITEM_H for s in parent["sub"])
-            top = min(max(yt_p, vis_bottom), max(vis_bottom, wh - MENU_H - total_h))
+            # Align with the parent row, then keep the whole panel inside the
+            # window: never hang below the screen edge and never cover the bar.
+            top = min(yt_p, wh - MENU_H)
+            if top - total_h < 4:
+                top = min(4 + total_h, wh - MENU_H)
             bot = top - total_h
             srows = []
             y = top
@@ -9359,6 +9363,8 @@ class RetroWindow(arcade.Window if arcade else object):
         path = getattr(self, "ui_path", [])
         child = path[depth] if len(path) > depth else None
         for ridx, (item, yt, yb) in enumerate(rows):
+            if yb < 2 or yt > wh - MENU_H:
+                continue
             if item is None:
                 ym = (yt + yb) / 2
                 self.ui_rect(x0 + 8, ym, x0 + w - 8, ym + 1, (C_EDGE[0], C_EDGE[1], C_EDGE[2], alpha))
