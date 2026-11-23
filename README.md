@@ -11,6 +11,7 @@ Gemini
 Copilot
 Kimi AI
 Grok AI
+Mistral AI (Vibe)
 
 https://github.com/JonnyWalker/PySNES
 https://github.com/nesdev-org/MesenCE
