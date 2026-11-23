@@ -5714,7 +5714,7 @@ class GBPPU:
                 attr = vram[0x2000 | m_off]
                 vbank = np.where((attr & 0x08) != 0, 0x2000, 0)
                 fy = np.where((attr & 0x40) != 0, 7 - (py & 7), py & 7)
-                fx = np.where((attr & 0x20) != 0, 7 - (px & 7), px & 7)
+                fx = np.where((attr & 0x20) != 0, px & 7, 7 - (px & 7))
             else:
                 attr = np.zeros(160, dtype=np.uint8)
                 vbank = 0
@@ -6576,6 +6576,20 @@ class GameBoyAdvance:
         if region == 7:
             b = self.oam
             return b[addr & 1023] | (b[(addr + 1) & 1023] << 8)
+        if region == 4:
+            if addr & 0x00FFFFFF >= 0x400:
+                return 0
+            a = addr & 0x3FF
+            if 0x100 <= a < 0x10E and (a - 0x100) % 4 < 2:
+                cnt = self.tm_cnt[(a - 0x100) >> 2]
+                low = (cnt >> ((a & 1) * 8)) & 0xFF
+                a1 = a + 1
+                if 0x100 <= a1 < 0x10E and (a1 - 0x100) % 4 < 2:
+                    high = (self.tm_cnt[(a1 - 0x100) >> 2] >> ((a1 & 1) * 8)) & 0xFF
+                else:
+                    high = self.io[a1] if a1 < 0x400 else 0
+                return low | (high << 8)
+            return self.io[a] | ((self.io[a + 1] if a < 0x3FF else 0) << 8)
         if 8 <= region <= 13:
             if region == 13 and self._eeprom:
                 return self._eeprom_read()
@@ -6618,6 +6632,10 @@ class GameBoyAdvance:
             b = self.oam
             return (b[addr & 1023] | (b[(addr + 1) & 1023] << 8)
                     | (b[(addr + 2) & 1023] << 16) | (b[(addr + 3) & 1023] << 24))
+        if region == 4:
+            if addr & 0x00FFFFFF >= 0x400:
+                return 0
+            return self.read16(addr) | (self.read16(addr + 2) << 16)
         if 8 <= region <= 13:
             if region == 13 and self._eeprom:
                 v = self._eeprom_read()
@@ -6627,8 +6645,7 @@ class GameBoyAdvance:
             if a + 3 < len(rom):
                 return rom[a] | (rom[a + 1] << 8) | (rom[a + 2] << 16) | (rom[a + 3] << 24)
             return 0
-        return (self.read8(addr) | (self.read8(addr + 1) << 8)
-                | (self.read8(addr + 2) << 16) | (self.read8(addr + 3) << 24))
+        return self.read16(addr) | (self.read16(addr + 2) << 16)
 
     def write8(self, addr, val):
         val &= 0xFF
@@ -6744,16 +6761,43 @@ class GameBoyAdvance:
         for ch in range(4):
             if not self.tm_en[ch] or self.tm_cas[ch]:
                 continue
+            divn = tm_divn[ch]
             acc = tm_acc[ch] + cycles
-            if acc < tm_divn[ch]:
+            if acc < divn:
                 tm_acc[ch] = acc
                 continue
-            tm_acc[ch] = 0
-            cnt = tm_cnt[ch] + 1
+            ticks, tm_acc[ch] = divmod(acc, divn)
+            cnt = tm_cnt[ch] + ticks
             if cnt > 0xFFFF:
                 self._gba_tm_overflow(ch)
             else:
                 tm_cnt[ch] = cnt
+
+    def _gba_steps(self, count):
+        r = self.r
+        step = self.step
+        if not self._tm_any:
+            for _ in range(count):
+                prev_pc = r[15]
+                step()
+                if r[15] == prev_pc:
+                    return False
+            return True
+        tick = self._tick_gba_timers
+        pend = 0
+        for _ in range(count):
+            prev_pc = r[15]
+            step()
+            pend += 1
+            if r[15] == prev_pc:
+                tick(pend)
+                return False
+            if pend == 16:
+                tick(16)
+                pend = 0
+        if pend:
+            tick(pend)
+        return True
 
     def _gba_tm_overflow(self, ch):
         io = self.io
@@ -6989,7 +7033,19 @@ class GameBoyAdvance:
         if self.cpsr & 0x20:
             pc = r[15] & ~1
             region = (pc >> 24) & 0xFF
-            if region == 6:
+            if region == 3:
+                b = self.iwram
+                a = pc & 0x7FFE
+                ins = b[a] | (b[a + 1] << 8)
+            elif region == 2:
+                b = self.ewram
+                a = pc & 0x3FFFE
+                ins = b[a] | (b[a + 1] << 8)
+            elif 8 <= region <= 13:
+                off = pc & 0x1FFFFFF
+                rom = self.rom
+                ins = rom[off] | (rom[off + 1] << 8) if off + 1 < len(rom) else 0
+            elif region == 6:
                 # VRAM-executed code (Classic NES wrapper): hardware 3-stage
                 # pipeline keeps a 2-deep fetch window; a store that patches
                 # code up to 2 instructions ahead must NOT change the word
@@ -7011,21 +7067,19 @@ class GameBoyAdvance:
                 self._pfq = nq
                 self._pfq_next = (pc + 2) & 0xFFFFFFFF
                 r[15] = (pc + 2) & 0xFFFFFFFF
-            elif region == 3:
-                b = self.iwram
-                a = pc & 0x7FFE
-                ins = b[a] | (b[a + 1] << 8)
-            elif region == 2:
-                b = self.ewram
-                a = pc & 0x3FFFE
-                ins = b[a] | (b[a + 1] << 8)
-            elif 8 <= region <= 13:
-                off = pc & 0x1FFFFFF
-                rom = self.rom
-                ins = rom[off] | (rom[off + 1] << 8) if off + 1 < len(rom) else 0
+            elif region >= 15 or region < 2:
+                # BIOS/unmapped bus fill reads as zeros (read16 composes two
+                # zero read8s here); ins == 0 is handled by the fast path below.
+                ins = 0
             else:
                 ins = self.read16(pc)
             r[15] = (pc + 2) & 0xFFFFFFFF
+            if ins == 0:
+                # movs r0, r0: the all-zero op dominates idle/open-bus
+                # streams; setting flags from r0 keeps semantics identical.
+                v = r[0]
+                self.cpsr = (self.cpsr & 0x3FFFFFFF) | (0x40000000 if v == 0 else 0) | (0x80000000 if v & 0x80000000 else 0)
+                return 1
             top = ins >> 13
             if top == 0:
                 op = (ins >> 11) & 3
@@ -7129,17 +7183,107 @@ class GameBoyAdvance:
                     v = self.read16(ad); r[rd] = (v | 0xFFFF0000) if (v & 0x8000) else v
             elif top == 3:
                 op = (ins >> 11) & 3
-                imm = (ins >> 6) & 0x1F
                 rb, rd = (ins >> 3) & 7, ins & 7
-                if op == 0: self.write32(r[rb] + (imm << 2), r[rd])
-                elif op == 1: r[rd] = self.read32(r[rb] + (imm << 2))
-                elif op == 2: self.write8(r[rb] + imm, r[rd])
-                else: r[rd] = self.read8(r[rb] + imm)
+                if op < 2:
+                    a = (r[rb] + (((ins >> 6) & 0x1F) << 2)) & 0xFFFFFFFF
+                else:
+                    a = (r[rb] + ((ins >> 6) & 0x1F)) & 0xFFFFFFFF
+                rg = (a >> 24) & 0xFF
+                if op == 0:
+                    if rg == 3:
+                        b = self.iwram
+                        a &= 0x7FFF
+                        v = r[rd]
+                        b[a] = v & 0xFF; b[a + 1] = (v >> 8) & 0xFF; b[a + 2] = (v >> 16) & 0xFF; b[a + 3] = (v >> 24) & 0xFF
+                    elif rg == 2:
+                        b = self.ewram
+                        a &= 0x3FFFF
+                        v = r[rd]
+                        b[a] = v & 0xFF; b[a + 1] = (v >> 8) & 0xFF; b[a + 2] = (v >> 16) & 0xFF; b[a + 3] = (v >> 24) & 0xFF
+                    else:
+                        self.write32(a, r[rd])
+                elif op == 1:
+                    if rg == 3:
+                        b = self.iwram
+                        a &= 0x7FFF
+                        r[rd] = b[a] | (b[a + 1] << 8) | (b[a + 2] << 16) | (b[a + 3] << 24)
+                    elif rg == 2:
+                        b = self.ewram
+                        a &= 0x3FFFF
+                        r[rd] = b[a] | (b[a + 1] << 8) | (b[a + 2] << 16) | (b[a + 3] << 24)
+                    elif rg == 4:
+                        if (a & 0x00FFFFFF) >= 0x400:
+                            r[rd] = 0
+                        else:
+                            r[rd] = self.read16(a) | (self.read16(a + 2) << 16)
+                    else:
+                        r[rd] = self.read32(a)
+                elif op == 2:
+                    if rg == 3: self.iwram[a & 0x7FFF] = r[rd] & 0xFF
+                    elif rg == 2: self.ewram[a & 0x3FFFF] = r[rd] & 0xFF
+                    else: self.write8(a, r[rd])
+                elif rg == 3:
+                    r[rd] = self.iwram[a & 0x7FFF]
+                elif rg == 2:
+                    r[rd] = self.ewram[a & 0x3FFFF]
+                elif rg == 4:
+                    if (a & 0x00FFFFFF) >= 0x400:
+                        r[rd] = 0
+                    else:
+                        a2 = a & 0x3FF
+                        if 0x100 <= a2 < 0x10E and (a2 - 0x100) % 4 < 2:
+                            r[rd] = (self.tm_cnt[(a2 - 0x100) >> 2] >> ((a2 & 1) * 8)) & 0xFF
+                        else:
+                            r[rd] = self.io[a2]
+                elif 8 <= rg <= 13:
+                    off = a & 0x1FFFFFF
+                    r[rd] = self.rom[off] if off < len(self.rom) else 0
+                else:
+                    r[rd] = self.read8(a)
             elif (ins & 0xF000) == 0x8000:
-                imm = ((ins >> 6) & 0x1F) << 1
-                rb, rd = (ins >> 3) & 7, ins & 7
-                if ins & 0x0800: r[rd] = self.read16(r[rb] + imm)
-                else: self.write16(r[rb] + imm, r[rd])
+                a = (r[(ins >> 3) & 7] + (((ins >> 6) & 0x1F) << 1)) & 0xFFFFFFFF
+                rg = (a >> 24) & 0xFF
+                if ins & 0x0800:
+                    if rg == 3:
+                        a &= 0x7FFF
+                        b = self.iwram
+                        r[ins & 7] = b[a] | (b[a + 1] << 8)
+                    elif rg == 2:
+                        a &= 0x3FFFF
+                        b = self.ewram
+                        r[ins & 7] = b[a] | (b[a + 1] << 8)
+                    elif rg == 4:
+                        if (a & 0x00FFFFFF) >= 0x400:
+                            r[ins & 7] = 0
+                        else:
+                            a &= 0x3FF
+                            b = self.io
+                            if 0x100 <= a < 0x10E and (a - 0x100) % 4 < 2:
+                                cnt = self.tm_cnt[(a - 0x100) >> 2]
+                                low = (cnt >> ((a & 1) * 8)) & 0xFF
+                                a1 = a + 1
+                                if 0x100 <= a1 < 0x10E and (a1 - 0x100) % 4 < 2:
+                                    high = (self.tm_cnt[(a1 - 0x100) >> 2] >> ((a1 & 1) * 8)) & 0xFF
+                                else:
+                                    high = b[a1] if a1 < 0x400 else 0
+                                r[ins & 7] = low | (high << 8)
+                            else:
+                                r[ins & 7] = b[a]
+                    else:
+                        r[ins & 7] = self.read16(a)
+                else:
+                    if rg == 3:
+                        a &= 0x7FFF
+                        b = self.iwram
+                        v = r[ins & 7]
+                        b[a] = v & 0xFF; b[a + 1] = (v >> 8) & 0xFF
+                    elif rg == 2:
+                        a &= 0x3FFFF
+                        b = self.ewram
+                        v = r[ins & 7]
+                        b[a] = v & 0xFF; b[a + 1] = (v >> 8) & 0xFF
+                    else:
+                        self.write16(a, r[ins & 7])
             elif (ins & 0xF000) == 0x9000:
                 rd = (ins >> 8) & 7
                 ad = (r[13] + ((ins & 0xFF) << 2)) & 0xFFFFFFFF
@@ -7793,8 +7937,6 @@ class GameBoyAdvance:
             return
 
         io = self.io
-        r = self.r
-        step = self.step
         for ly in range(228):
             io[6] = ly
             if io[5] == ly:
@@ -7817,25 +7959,13 @@ class GameBoyAdvance:
                 io[4] &= ~0x01
             if ly < 160:
                 io[4] &= ~0x02
-                for _ in range(336):
-                    prev_pc = r[15]
-                    step()
-                    if self._tm_any:
-                        self._tick_gba_timers(1)
-                    if r[15] == prev_pc:
-                        break
+                self._gba_steps(336)
             io[4] |= 0x02
             self._fire_gba_dma(2)
             if io[4] & 0x10:
                 io[0x202] |= 0x02
                 self._take_gba_irq()
-            for _ in range(336 if ly >= 160 else 96):
-                prev_pc = r[15]
-                step()
-                if self._tm_any:
-                    self._tick_gba_timers(1)
-                if r[15] == prev_pc:
-                    break
+            self._gba_steps(336 if ly >= 160 else 96)
         if draw:
             self._render_frame()
         self.apu.run_frame()
@@ -8126,15 +8256,26 @@ class FDSDrive:
         self.file_size = 0
         self.written = False
         self.bus = None
+        # Real-drive transfer: the head streams one byte every 149 1/3 CPU
+        # cycles of a full scanline (113 2/3 CPU cycles), so each scanline
+        # advances the head by 341/448 bytes. Bytes latch into a shift
+        # register that $4031 reads back, and the byte-transfer flag in
+        # $4030.D0 pulses once per byte (IRQ when $4025.7 set).
+        self.xfer_acc = 0
+        self.btf = False
+        self.latch = 0
+        self.eof_flag = False
 
     def read(self, a):
         a &= 0xFFFF
         if a == 0x4030:
-            v = self.ctrl & 0x08
-            if self.irq_pending:
-                v |= 1
-            if self.seek_irq:
-                v |= 2
+            v = self.ctrl & 0x08          # D3 echoes the last $4025.D3 write
+            if self.btf:
+                v |= 1                    # D0: byte transfer completed
+            if self.eof_flag:
+                v |= 2                    # D1: end of head
+            self.btf = False
+            self.eof_flag = False
             self.irq_pending = False
             self.seek_irq = False
             self._push_irq()
@@ -8142,25 +8283,41 @@ class FDSDrive:
         if a == 0x4031:
             if self.in_disk == 255 or not (self.ctrl & 0x04):
                 return 0xFF
-            if self.in_disk < len(self.sides) and self.disk_pos < self.block_len:
-                v = self.sides[self.in_disk][(self.block_start + self.disk_pos) % len(self.sides[self.in_disk])]
-                self.disk_pos += 1
-            else:
-                v = 0xFF
-            self.seek_cnt = 150
-            return v
+            return self.latch
         if a == 0x4032:
             v = 0
             if self.in_disk == 255:
-                v |= 5
+                v |= 1                    # D0: disk ejected
             elif not (self.ctrl & 1) or (self.ctrl & 2):
-                v |= 2
+                v |= 2                    # D1: disk not ready
             return v
         if a == 0x4033:
             return 0x80
         if 0x4090 <= a < 0x4093:
             return self.snd.read(a)
         return 0
+
+    def _xfer_byte(self):
+        if self.in_disk == 255:
+            return
+        if self.disk_pos >= self.block_len:
+            if not self.eof_flag and (self.ctrl & 0x80):
+                self.eof_flag = True
+                self.seek_irq = True
+            return
+        side = self.sides[self.in_disk]
+        pos = (self.block_start + self.disk_pos) % len(side)
+        if self.ctrl & 0x04:
+            self.latch = side[pos]
+        else:
+            b = bytearray(side)
+            b[pos] = self.latch
+            self.sides[self.in_disk] = bytes(b)
+            self.written = True
+        self.disk_pos += 1
+        self.btf = True
+        if self.ctrl & 0x80:
+            self.irq_pending = True
 
     def write(self, a, v):
         a &= 0xFFFF
@@ -8182,12 +8339,8 @@ class FDSDrive:
                 self.irq_pending = False
             self.ctl4023 = v
         elif a == 0x4024:
-            if self.in_disk != 255 and not (self.ctrl & 0x04) and self.disk_pos < self.block_len:
-                side = bytearray(self.sides[self.in_disk])
-                side[self.block_start + self.disk_pos] = v
-                self.sides[self.in_disk] = bytes(side)
-                self.disk_pos += 1
-                self.written = True
+            if self.in_disk != 255 and not (self.ctrl & 0x04):
+                self.latch = v & 0xFF     # shift register; committed at byte time
         elif a == 0x4025:
             if self.in_disk != 255:
                 if (v & 0x40) and not (self.ctrl & 0x40):
@@ -8222,6 +8375,11 @@ class FDSDrive:
                 self.irq_pending = True
                 if not self.irq_rep:
                     self.irq_en = False
+        if self.in_disk != 255 and (self.ctrl & 0x01):
+            self.xfer_acc += 341          # 113 2/3 CPU cycles per scanline
+            while self.xfer_acc >= 448:   # 149 1/3 CPU cycles per byte
+                self.xfer_acc -= 448
+                self._xfer_byte()
             self._push_irq()
         if self.ctl4023 & 0x02:
             if self.seek_cnt > 0:
@@ -8253,6 +8411,9 @@ class Famicom(NES):
         else:
             super().__init__(rom_path, sample_rate)
 
+    def fds_disk_bytes(self):
+        return b"".join(self.fds.sides)
+
     def _init_fds(self, rom_path: str, raw: bytes, sample_rate: int):
         self.rom_path = rom_path
         disk_data = raw[16:] if raw[:4] == b"FDS\x1a" else raw
@@ -8269,6 +8430,26 @@ class Famicom(NES):
         if files:
             return self._init_fds_disk(rom_path, sides, files, sample_rate)
         return self._init_fds_stub(rom_path, raw, sample_rate)
+
+    def _load_battery(self):
+        if self.fds is None:
+            return
+        try:
+            with open(self.base_path + ".sav", "rb") as f:
+                data = f.read()
+        except OSError:
+            return
+        if data[:4] == b"FDS\x1a":
+            data = data[16:]
+        usable = data[:len(data) - (len(data) % 65500)]
+        if usable:
+            self.fds.sides = [bytes(usable[i:i + 65500]) for i in range(0, len(usable), 65500)]
+
+    def save_battery(self):
+        if self.fds is None or not self.fds.written:
+            return
+        with open(self.base_path + ".sav", "wb") as f:
+            f.write(self.fds_disk_bytes())
 
     def _init_fds_disk(self, rom_path, sides, files, sample_rate):
         self.rom_path = rom_path
