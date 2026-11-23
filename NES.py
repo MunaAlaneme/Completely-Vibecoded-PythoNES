@@ -2865,6 +2865,9 @@ class SNESAPU:
         self.gba_io = None
         self.gba_fifo_a = bytearray()
         self.gba_fifo_b = bytearray()
+        self.n64_buf = np.zeros(0, dtype=np.int16)
+        self.n64_pos = 0.0
+        self.n64_step = 1.0
 
     def read_port(self, idx):
         idx &= 3
@@ -2909,6 +2912,42 @@ class SNESAPU:
             self.freqs[ch] = 110.0 * (2.0 ** (note_idx / 12.0))
             self.amps[ch] = 0.18
             self.note_decay[ch] = 0.975
+
+    def push_n64(self, pcm, rate):
+        pcm = np.asarray(pcm, dtype=np.int16).reshape(-1)
+        if pcm.size == 0:
+            return
+        self.n64_step = min(4.0, max(0.25, float(rate) / self.sr))
+        buf = self.n64_buf
+        if buf.size:
+            self.n64_buf = np.concatenate((buf, pcm))
+        else:
+            self.n64_buf = pcm.copy()
+            self.n64_pos = 0.0
+        if self.n64_buf.size > (1 << 18):
+            pos = int(self.n64_pos)
+            self.n64_buf = self.n64_buf[pos:]
+            self.n64_pos = 0.0
+
+    def _render_n64_samples(self, n):
+        out = np.zeros(n, dtype=np.float32)
+        buf = self.n64_buf
+        if buf.size < 2:
+            return out
+        end = self.n64_pos + n * self.n64_step
+        if end >= buf.size - 1:
+            end = float(buf.size - 2)
+        src = np.linspace(self.n64_pos, end, n)
+        lo = src.astype(np.intp)
+        hi = np.minimum(lo + 1, buf.size - 1)
+        frac = (src - lo).astype(np.float32)
+        out = buf[lo].astype(np.float32) * (1.0 - frac) + buf[hi].astype(np.float32) * frac
+        self.n64_pos = end
+        cut = int(self.n64_pos)
+        if cut > (1 << 16):
+            self.n64_buf = buf[cut:]
+            self.n64_pos -= cut
+        return out
 
     def _render_gba_samples(self, n):
         io = self.gba_io
@@ -3005,6 +3044,8 @@ class SNESAPU:
             return
         if self.mode == "gba":
             out = self._render_gba_samples(n)
+        elif self.mode == "n64":
+            out = self._render_n64_samples(n)
         else:
             out = self._render_snes_samples(n)
         m = float(out.mean())
@@ -3743,7 +3784,23 @@ class CPU65c816:
         for bop in (0x10, 0x30, 0x50, 0x70, 0x80, 0x90, 0xB0, 0xD0, 0xF0):
             def make_br(op=bop):
                 def run():
-                    return cpu._br_any(op)
+                    off = f8()
+                    if off & 0x80: off -= 256
+                    if op == 0xD0: cond = not cpu.z
+                    elif op == 0xF0: cond = cpu.z
+                    elif op == 0x80: cond = True
+                    elif op == 0x10: cond = not cpu.n
+                    elif op == 0x30: cond = cpu.n
+                    elif op == 0x50: cond = not cpu.v
+                    elif op == 0x70: cond = cpu.v
+                    elif op == 0x90: cond = not cpu.c
+                    else: cond = cpu.c
+                    if cond:
+                        cpu.pc = (cpu.pc + off) & 0xFFFF
+                        cpu.cycles += 3
+                        return 3
+                    cpu.cycles += 2
+                    return 2
                 return run
             handlers[bop] = make_br()
 
@@ -3754,20 +3811,62 @@ class CPU65c816:
                 return 2
             return run
 
-        def bit(b, ad):
+        def bit_abs():
+            ad = f16()
             if cpu.m_flag:
-                m = rd(b, ad)
+                m = rd(cpu.dbr, ad)
                 cpu.z = int(((cpu.a & 0xFF) & m) == 0)
                 cpu.n = (m >> 7) & 1; cpu.v = (m >> 6) & 1
             else:
-                m = cpu._read16(b, ad)
+                m = cpu._read16(cpu.dbr, ad)
                 cpu.z = int((cpu.a & m) == 0)
                 cpu.n = (m >> 15) & 1; cpu.v = (m >> 14) & 1
+            cpu.cycles += 4
+            return 4
 
-        handlers[0x2C] = cyc2(lambda: bit(cpu.dbr, f16()))
-        handlers[0x24] = cyc2(lambda: bit(0, (cpu.d + f8()) & 0xFFFF))
-        handlers[0x3C] = cyc2(lambda: bit(cpu.dbr, (f16() + cpu.x) & 0xFFFF))
-        handlers[0x34] = cyc2(lambda: bit(0, (cpu.d + f8() + cpu.x) & 0xFFFF))
+        def bit_dp():
+            ad = (cpu.d + f8()) & 0xFFFF
+            if cpu.m_flag:
+                m = rd(0, ad)
+                cpu.z = int(((cpu.a & 0xFF) & m) == 0)
+                cpu.n = (m >> 7) & 1; cpu.v = (m >> 6) & 1
+            else:
+                m = cpu._read16(0, ad)
+                cpu.z = int((cpu.a & m) == 0)
+                cpu.n = (m >> 15) & 1; cpu.v = (m >> 14) & 1
+            cpu.cycles += 3
+            return 3
+
+        def bit_abx():
+            ad = (f16() + cpu.x) & 0xFFFF
+            if cpu.m_flag:
+                m = rd(cpu.dbr, ad)
+                cpu.z = int(((cpu.a & 0xFF) & m) == 0)
+                cpu.n = (m >> 7) & 1; cpu.v = (m >> 6) & 1
+            else:
+                m = cpu._read16(cpu.dbr, ad)
+                cpu.z = int((cpu.a & m) == 0)
+                cpu.n = (m >> 15) & 1; cpu.v = (m >> 14) & 1
+            cpu.cycles += 4
+            return 4
+
+        def bit_dpx():
+            ad = (cpu.d + f8() + cpu.x) & 0xFFFF
+            if cpu.m_flag:
+                m = rd(0, ad)
+                cpu.z = int(((cpu.a & 0xFF) & m) == 0)
+                cpu.n = (m >> 7) & 1; cpu.v = (m >> 6) & 1
+            else:
+                m = cpu._read16(0, ad)
+                cpu.z = int((cpu.a & m) == 0)
+                cpu.n = (m >> 15) & 1; cpu.v = (m >> 14) & 1
+            cpu.cycles += 4
+            return 4
+
+        handlers[0x2C] = bit_abs
+        handlers[0x24] = bit_dp
+        handlers[0x3C] = bit_abx
+        handlers[0x34] = bit_dpx
 
         def lda_imm():
             if cpu.m_flag:
@@ -4201,10 +4300,10 @@ class CPU65c816:
 
         # BIT / CPX / CPY
         elif op in (0x24, 0x34, 0x2C, 0x3C):                           # BIT mem
-            if op == 0x24: b, ad = 0, (self.d + self._fetch8()) & 0xFFFF
-            elif op == 0x34: b, ad = 0, (self.d + self._fetch8() + self.x) & 0xFFFF
-            elif op == 0x2C: b, ad = self.dbr, self._fetch16()
-            else: b, ad = self.dbr, (self._fetch16() + self.x) & 0xFFFF
+            if op == 0x24: b, ad = 0, (self.d + self._fetch8()) & 0xFFFF; cyc = 3
+            elif op == 0x34: b, ad = 0, (self.d + self._fetch8() + self.x) & 0xFFFF; cyc = 4
+            elif op == 0x2C: b, ad = self.dbr, self._fetch16(); cyc = 4
+            else: b, ad = self.dbr, (self._fetch16() + self.x) & 0xFFFF; cyc = 4
             if self.m_flag:
                 m = self.bus.read(b, ad)
                 self.z = int(((self.a & 0xFF) & m) == 0)
@@ -6255,6 +6354,20 @@ class GameBoyAdvance:
         self.buttons = 0
         self.frames = 0
         self._irq_stack = []
+        self.tm_cnt = [0, 0, 0, 0]
+        self.tm_en = [False] * 4
+        self.tm_cas = [False] * 4
+        self.tm_divn = [1, 1, 1, 1]
+        self.tm_acc = [0, 0, 0, 0]
+        self._tm_any = False
+        self._pfq = {}
+        self._pfq_next = None
+        self._eeprom = (len(self.rom) > 0xB0 and self.rom[0xAC] == 0x46)
+        self._eeprom_cmd = 0
+        self._eeprom_read_addr = 0
+        self._eeprom_write_addr = 0
+        self._eeprom_read_bits = 0
+        self._eeprom_data = bytearray(b"\xff" * 0x200)
         self._boot_anim_frame = 0
         self._boot_anim_total = 96  # ~1.6s authentic GBA BIOS bootup animation
         self._load_battery()
@@ -6385,6 +6498,8 @@ class GameBoyAdvance:
         self.r[15] = 0x08000000  # PC (Cartridge ROM entry point)
         self.cpsr = 0x0000001F   # System mode, ARM state
         self.spsr = 0
+        self._eeprom_cmd = 0
+        self._eeprom_read_bits = 0
         self._irq_stack.clear()
         self._boot_anim_frame = 0
         if getattr(self, "_boot_done_gba", False):
@@ -6413,7 +6528,13 @@ class GameBoyAdvance:
         region = (addr >> 24) & 0xFF
         if region == 2: return self.ewram[addr & 0x3FFFF]
         if region == 3: return self.iwram[addr & 0x7FFF]
-        if region == 4: return self.io[addr & 0x3FF]
+        if region == 4:
+            if addr & 0x00FFFFFF >= 0x400:
+                return 0
+            a = addr & 0x3FF
+            if 0x100 <= a < 0x10E and (a - 0x100) % 4 < 2:
+                return (self.tm_cnt[(a - 0x100) >> 2] >> ((a & 1) * 8)) & 0xFF
+            return self.io[a]
         if region == 5: return self.pram[addr & 0x3FF]
         if region == 6:
             # 96KB VRAM; 0x18000-0x1FFFF mirrors the OBJ region at 0x10000.
@@ -6423,9 +6544,12 @@ class GameBoyAdvance:
             return self.vram[a]
         if region == 7: return self.oam[addr & 0x3FF]
         if 8 <= region <= 13:
+            if region == 13 and self._eeprom:
+                return 1
             off = addr & 0x1FFFFFF
             return self.rom[off] if off < len(self.rom) else 0
-        if region == 14: return self.sram[addr & 0xFFFF]
+        if region == 14:
+            return 0xFF if self._eeprom else self.sram[addr & 0xFFFF]
         return 0
 
     def read16(self, addr):
@@ -6453,6 +6577,8 @@ class GameBoyAdvance:
             b = self.oam
             return b[addr & 1023] | (b[(addr + 1) & 1023] << 8)
         if 8 <= region <= 13:
+            if region == 13 and self._eeprom:
+                return self._eeprom_read()
             a = addr & 0x1FFFFFF
             rom = self.rom
             if a + 1 < len(rom):
@@ -6493,6 +6619,9 @@ class GameBoyAdvance:
             return (b[addr & 1023] | (b[(addr + 1) & 1023] << 8)
                     | (b[(addr + 2) & 1023] << 16) | (b[(addr + 3) & 1023] << 24))
         if 8 <= region <= 13:
+            if region == 13 and self._eeprom:
+                v = self._eeprom_read()
+                return v | (v << 16)
             a = addr & 0x1FFFFFF
             rom = self.rom
             if a + 3 < len(rom):
@@ -6507,6 +6636,8 @@ class GameBoyAdvance:
         if region == 2: self.ewram[addr & 0x3FFFF] = val
         elif region == 3: self.iwram[addr & 0x7FFF] = val
         elif region == 4:
+            if addr & 0x00FFFFFF >= 0x400:
+                return
             a = addr & 0x3FF
             if a in (0x202, 0x203):  # IF is write-1-to-clear on GBA hardware
                 self.io[a] &= ~val
@@ -6516,8 +6647,24 @@ class GameBoyAdvance:
                 self.apu.gba_fifo_a.append(val)
             elif 0xA4 <= a <= 0xA7 and len(self.apu.gba_fifo_b) < 2048:
                 self.apu.gba_fifo_b.append(val)
-            elif a in (0xBD, 0xC9, 0xD5, 0xE1) and (val & 0x80):
-                self._run_dma((a - 0xB0) // 12)
+            elif a in (0xBB, 0xC7, 0xD3, 0xDF) and (val & 0x80):
+                # CPU writes DMAxCNT_H high byte -> immediate DMA trigger.
+                # Enable (bit15) lives in the high byte: ctrl = base + 12/13 in
+                # the 12-byte stride layout used by _run_dma. Start timings 1
+                # (VBlank) and 2 (HBlank) must wait for the PPU phase boundary.
+                if (val >> 4) & 3 in (0, 3):
+                    self._run_dma((a - 0xB0) // 12)
+            elif a in (0x102, 0x106, 0x10A, 0x10E):
+                ch = (a - 0x102) >> 2
+                if val & 0x80:
+                    self.tm_cnt[ch] = self.io[a - 2] | (self.io[a - 1] << 8)
+                    self.tm_acc[ch] = 0
+                    self.tm_en[ch] = True
+                else:
+                    self.tm_en[ch] = False
+                self.tm_cas[ch] = (val & 3) == 3 and ch > 0
+                self.tm_divn[ch] = 1 if self.tm_cas[ch] else (1, 64, 256, 1024)[val & 3]
+                self._tm_any = any(self.tm_en[ch] and not self.tm_cas[ch] for ch in range(4))
         elif region == 5: self.pram[addr & 0x3FF] = val
         elif region == 6:
             a = addr & 0x1FFFF
@@ -6525,7 +6672,9 @@ class GameBoyAdvance:
                 a = 0x10000 | (a & 0x7FFF)
             self.vram[a] = val
         elif region == 7: self.oam[addr & 0x3FF] = val
-        elif region == 14: self.sram[addr & 0xFFFF] = val
+        elif region == 14:
+            if not self._eeprom:
+                self.sram[addr & 0xFFFF] = val
 
     def write16(self, addr, val):
         addr &= ~1
@@ -6545,19 +6694,40 @@ class GameBoyAdvance:
         dad = self.io[base + 4] | (self.io[base + 5] << 8) | (self.io[base + 6] << 16) | (self.io[base + 7] << 24)
         cnt = self.io[base + 8] | (self.io[base + 9] << 8)
         ctrl = self.io[base + 10] | (self.io[base + 11] << 8)
-        if cnt == 0:
-            cnt = 0x4000
         word32 = bool(ctrl & 0x0400)
         step = 4 if word32 else 2
-        d_ctl = (ctrl >> 5) & 3
-        s_ctl = (ctrl >> 7) & 3
+        d_ctl = (ctrl >> 6) & 3
+        s_ctl = (ctrl >> 4) & 3
+        if (ctrl >> 12) & 3 == 3:
+            # Special (FIFO) timing: both addresses stay fixed and the game's
+            # count field is meaningless; hardware copies 4 units per request.
+            # 16-bit units fill half a FIFO entry per write (Classic NES audio).
+            for _ in range(4):
+                if word32:
+                    self.write32(dad, self.read32(sad))
+                else:
+                    self.write16(dad, self.read16(sad))
+            return
+        if cnt == 0:
+            cnt = 0x4000
         d_step = step if d_ctl in (0, 3) else (-step if d_ctl == 1 else 0)
         s_step = step if s_ctl == 0 else (-step if s_ctl == 1 else 0)
-        for _ in range(cnt):
+        s_ep = False
+        d_ep = False
+        if not word32:
+            if (dad >> 24) == 13 and not self._eeprom:
+                self._eeprom = True
+            s_ep = self._eeprom and (sad >> 24) == 13
+            d_ep = self._eeprom and (dad >> 24) == 13
+        for i in range(cnt):
             if word32:
                 self.write32(dad, self.read32(sad))
             else:
-                self.write16(dad, self.read16(sad))
+                src = self._eeprom_read() if s_ep else self.read16(sad)
+                if d_ep:
+                    self._eeprom_write(src, remaining=cnt - i)
+                else:
+                    self.write16(dad, src)
             sad = (sad + s_step) & 0xFFFFFFFF
             dad = (dad + d_step) & 0xFFFFFFFF
         if not (ctrl & 0x0200):
@@ -6568,6 +6738,112 @@ class GameBoyAdvance:
             # not waiting until the next step.
             self.io[0x202] |= (0x01 << (8 + ch)) & 0xFF
             self._take_gba_irq()
+
+    def _tick_gba_timers(self, cycles):
+        tm_cnt, tm_acc, tm_divn = self.tm_cnt, self.tm_acc, self.tm_divn
+        for ch in range(4):
+            if not self.tm_en[ch] or self.tm_cas[ch]:
+                continue
+            acc = tm_acc[ch] + cycles
+            if acc < tm_divn[ch]:
+                tm_acc[ch] = acc
+                continue
+            tm_acc[ch] = 0
+            cnt = tm_cnt[ch] + 1
+            if cnt > 0xFFFF:
+                self._gba_tm_overflow(ch)
+            else:
+                tm_cnt[ch] = cnt
+
+    def _gba_tm_overflow(self, ch):
+        io = self.io
+        base = 0x100 + ch * 4
+        self.tm_cnt[ch] = io[base] | (io[base + 1] << 8)
+        self.tm_acc[ch] = 0
+        if io[base + 3] & 0x40:
+            io[0x202] |= (0x08 << ch) & 0xFF
+            self._take_gba_irq()
+        if ch < 3 and self.tm_en[ch + 1] and self.tm_cas[ch + 1]:
+            self._gba_tm_overflow(ch + 1)
+        if ch < 2:
+            dbase = 0xB0 + (ch + 1) * 12
+            ctrl = io[dbase + 10] | (io[dbase + 11] << 8)
+            if (io[dbase + 11] & 0x80) and ((ctrl >> 12) & 3) == 3:
+                dad = io[dbase + 4] | (io[dbase + 5] << 8) | (io[dbase + 6] << 16) | (io[dbase + 7] << 24)
+                if 0x040000A0 <= dad < 0x040000A8 and ((dad - 0x040000A0) >> 2) == ch:
+                    self._run_dma(ch + 1)
+
+    def _sync_gba_timers(self):
+        io = self.io
+        for ch in range(4):
+            base = 0x100 + ch * 4
+            val = io[base + 2]
+            if val & 0x80:
+                self.tm_en[ch] = True
+                self.tm_cnt[ch] = io[base] | (io[base + 1] << 8)
+            else:
+                self.tm_en[ch] = False
+            self.tm_cas[ch] = (val & 3) == 3 and ch > 0
+            self.tm_divn[ch] = 1 if self.tm_cas[ch] else (1, 64, 256, 1024)[val & 3]
+            self.tm_acc[ch] = 0
+        self._tm_any = any(self.tm_en[ch] and not self.tm_cas[ch] for ch in range(4))
+
+    def _eeprom_write(self, value, remaining):
+        cmd = self._eeprom_cmd
+        if cmd == 0:
+            self._eeprom_cmd = value & 1
+        elif cmd == 1:
+            cmd = (cmd << 1) | (value & 1)
+            self._eeprom_cmd = cmd
+            if cmd == 2:
+                self._eeprom_write_addr = 0
+            else:
+                self._eeprom_read_addr = 0
+        elif cmd == 2:
+            if remaining > 65:
+                self._eeprom_write_addr = (self._eeprom_write_addr << 1) | ((value & 1) << 6)
+            elif remaining == 1:
+                self._eeprom_cmd = 0
+            elif (self._eeprom_write_addr >> 3) < 0x2000:
+                wa = self._eeprom_write_addr
+                if (wa >> 3) >= len(self._eeprom_data):
+                    self._eeprom_data.extend(b"\xff" * (0x2000 - len(self._eeprom_data)))
+                bit = 0x7 - (wa & 7)
+                cur = self._eeprom_data[wa >> 3]
+                cur &= ~(1 << bit)
+                cur |= (value & 1) << bit
+                self._eeprom_data[wa >> 3] = cur
+                self._eeprom_write_addr = wa + 1
+        elif cmd == 3:
+            if remaining > 1:
+                ra = self._eeprom_read_addr << 1
+                if value & 1:
+                    ra |= 0x40
+                self._eeprom_read_addr = ra
+            else:
+                self._eeprom_read_bits = 68
+                self._eeprom_cmd = 4
+
+    def _eeprom_read(self):
+        if self._eeprom_cmd != 4:
+            return 1
+        self._eeprom_read_bits -= 1
+        if self._eeprom_read_bits < 64:
+            step = 63 - self._eeprom_read_bits
+            address = (self._eeprom_read_addr + step) >> 3
+            if address >= len(self._eeprom_data):
+                return 0xFF
+            if self._eeprom_read_bits == 0:
+                self._eeprom_cmd = 0
+            return (self._eeprom_data[address] >> (0x7 - (step & 0x7))) & 1
+        return 0
+
+    def _fire_gba_dma(self, timing):
+        io = self.io
+        for ch in range(4):
+            hi = io[0xB0 + ch * 12 + 11]
+            if (hi & 0x80) and ((hi >> 4) & 3) == timing:
+                self._run_dma(ch)
 
     def _take_gba_irq(self):
         """Dispatch a pending GBA interrupt (IE & IF, IME and IRQ mode permitting)."""
@@ -6684,8 +6960,11 @@ class GameBoyAdvance:
                             out.append(out[-disp] if disp <= len(out) else 0)
                     else:
                         out.append(self.read8(src)); src += 1
-            for i in range(0, len(out) & ~1, 2):
+            n = len(out) & ~1
+            for i in range(0, n, 2):
                 self.write16(dst + i, out[i] | (out[i + 1] << 8))
+            if len(out) & 1:
+                self.write8(dst + n, out[-1])
 
     def _return_from_bios_irq(self):
         """Restore saved CPU registers and CPSR when game IRQ handler returns to BIOS."""
@@ -6700,9 +6979,52 @@ class GameBoyAdvance:
             self._return_from_bios_irq()
             return 2
 
+        if self.io[0x202] and not self._irq_stack:
+            self._take_gba_irq()
+
+        pcf = (r[15] & ~1) if (self.cpsr & 0x20) else (r[15] & ~3)
+        if pcf != self._pfq_next:
+            self._pfq = {}
+        self._pfq_next = None
         if self.cpsr & 0x20:
             pc = r[15] & ~1
-            ins = self.read16(pc)
+            region = (pc >> 24) & 0xFF
+            if region == 6:
+                # VRAM-executed code (Classic NES wrapper): hardware 3-stage
+                # pipeline keeps a 2-deep fetch window; a store that patches
+                # code up to 2 instructions ahead must NOT change the word
+                # already latched in the pipeline.
+                v = self.vram
+                q = self._pfq
+                w = q.pop(pc, None)
+                if w is None:
+                    a = pc & 0x1FFFE
+                    w = v[a] | (v[a + 1] << 8)
+                ins = w
+                nq = {}
+                for na in ((pc + 2) & 0xFFFFFFFF, (pc + 4) & 0xFFFFFFFF):
+                    ow = q.pop(na, None)
+                    if ow is None:
+                        a2 = na & 0x1FFFE
+                        ow = v[a2] | (v[a2 + 1] << 8)
+                    nq[na] = ow
+                self._pfq = nq
+                self._pfq_next = (pc + 2) & 0xFFFFFFFF
+                r[15] = (pc + 2) & 0xFFFFFFFF
+            elif region == 3:
+                b = self.iwram
+                a = pc & 0x7FFE
+                ins = b[a] | (b[a + 1] << 8)
+            elif region == 2:
+                b = self.ewram
+                a = pc & 0x3FFFE
+                ins = b[a] | (b[a + 1] << 8)
+            elif 8 <= region <= 13:
+                off = pc & 0x1FFFFFF
+                rom = self.rom
+                ins = rom[off] | (rom[off + 1] << 8) if off + 1 < len(rom) else 0
+            else:
+                ins = self.read16(pc)
             r[15] = (pc + 2) & 0xFFFFFFFF
             top = ins >> 13
             if top == 0:
@@ -6711,12 +7033,18 @@ class GameBoyAdvance:
                 if op < 3:
                     imm = (ins >> 6) & 0x1F
                     v = r[rs]
-                    if op == 0: res = (v << imm) & 0xFFFFFFFF
-                    elif op == 1: res = (v >> imm) if imm else 0
+                    s_v = (v - 0x100000000) if (v & 0x80000000) else v
+                    if op == 0:
+                        res = (v << imm) & 0xFFFFFFFF
+                        c = (v >> (32 - imm)) & 1 if imm else (1 if (self.cpsr & 0x20000000) else 0)
+                    elif op == 1:
+                        res = (v >> imm) if imm else 0
+                        c = (v >> (imm - 1)) & 1 if imm else (1 if (self.cpsr & 0x20000000) else 0)
                     else:
-                        s_v = (v - 0x100000000) if (v & 0x80000000) else v
                         res = ((s_v >> imm) if imm else (0xFFFFFFFF if s_v < 0 else 0)) & 0xFFFFFFFF
+                        c = ((s_v >> (imm - 1)) & 1) if imm else (1 if s_v < 0 else 0)
                     r[rd] = res; self._set_nz(res)
+                    self.cpsr = (self.cpsr & ~0x20000000) | (0x20000000 if c else 0)
                 else:
                     rn_imm = (ins >> 6) & 7
                     val = rn_imm if (ins & 0x0400) else r[rn_imm]
@@ -6824,7 +7152,7 @@ class GameBoyAdvance:
             elif (ins & 0xFF00) == 0xB000:
                 off = (ins & 0x7F) << 2
                 r[13] = ((r[13] - off) if (ins & 0x80) else (r[13] + off)) & 0xFFFFFFFF
-            elif (ins & 0xF600) == 0xB400:
+            elif (ins & 0xFE00) == 0xB400:
                 sp = r[13]
                 if ins & 0x0100:
                     sp = (sp - 4) & 0xFFFFFFFF; self.write32(sp, r[14])
@@ -6832,7 +7160,7 @@ class GameBoyAdvance:
                     if ins & (1 << reg_i):
                         sp = (sp - 4) & 0xFFFFFFFF; self.write32(sp, r[reg_i])
                 r[13] = sp
-            elif (ins & 0xF600) == 0xBC00:
+            elif (ins & 0xFE00) == 0xBC00:
                 sp = r[13]
                 for reg_i in range(8):
                     if ins & (1 << reg_i):
@@ -6842,8 +7170,9 @@ class GameBoyAdvance:
                     if (target & ~3) == self._BIOS_IRQ_RET and self._irq_stack:
                         self._return_from_bios_irq()
                         return 2
-                    elif target & 1 or (target >= 0x08000000): r[15] = target & ~1
-                    else: self.cpsr &= ~0x20; r[15] = target & ~3
+                    elif target & 1: r[15] = target & ~1
+                    else:
+                        self.cpsr &= ~0x20; r[15] = target & ~3
                 r[13] = sp
             elif (ins & 0xF000) == 0xC000:
                 rb = (ins >> 8) & 7
@@ -6880,9 +7209,42 @@ class GameBoyAdvance:
 
         # ARM state (32-bit instructions)
         pc = r[15] & ~3
-        ins = self.read32(pc)
+        region = (pc >> 24) & 0xFF
+        if region == 6:
+            v = self.vram
+            q = self._pfq
+            w = q.pop(pc, None)
+            if w is None:
+                a = pc & 0x1FFFC
+                w = v[a] | (v[a + 1] << 8) | (v[a + 2] << 16) | (v[a + 3] << 24)
+            ins = w
+            nq = {}
+            for na in ((pc + 4) & 0xFFFFFFFF, (pc + 8) & 0xFFFFFFFF):
+                ow = q.pop(na, None)
+                if ow is None:
+                    a2 = na & 0x1FFFC
+                    ow = v[a2] | (v[a2 + 1] << 8) | (v[a2 + 2] << 16) | (v[a2 + 3] << 24)
+                nq[na] = ow
+            self._pfq = nq
+            self._pfq_next = (pc + 4) & 0xFFFFFFFF
+            r[15] = (pc + 4) & 0xFFFFFFFF
+        elif region == 3:
+            b = self.iwram
+            a = pc & 0x7FFC
+            ins = b[a] | (b[a + 1] << 8) | (b[a + 2] << 16) | (b[a + 3] << 24)
+        elif region == 2:
+            b = self.ewram
+            a = pc & 0x3FFFC
+            ins = b[a] | (b[a + 1] << 8) | (b[a + 2] << 16) | (b[a + 3] << 24)
+        elif 8 <= region <= 13:
+            off = pc & 0x1FFFFFF
+            rom = self.rom
+            ins = (rom[off] | (rom[off + 1] << 8) | (rom[off + 2] << 16)
+                   | (rom[off + 3] << 24)) if off + 3 < len(rom) else 0
+        else:
+            ins = self.read32(pc)
         r[15] = (pc + 4) & 0xFFFFFFFF
-        if not self._cond_ok((ins >> 28) & 0xF):
+        if (ins >> 28) != 0xE and not self._cond_ok((ins >> 28) & 0xF):
             return 1
         op_type = (ins >> 25) & 7
         if op_type == 7 and (ins & 0x01000000):
@@ -6971,7 +7333,10 @@ class GameBoyAdvance:
                                 return 2
                             if (ins & 0x00400000) and self.spsr:
                                 self.cpsr = self.spsr
-                            r[15] = (val & ~1) if (self.cpsr & 0x20) else (val & ~3)
+                            if val & 1:
+                                self.cpsr |= 0x20; r[15] = val & ~1
+                            else:
+                                self.cpsr &= ~0x20; r[15] = val & ~3
                         else:
                             r[reg_i] = val
                     else:
@@ -6992,6 +7357,7 @@ class GameBoyAdvance:
                     else: self.spsr = val
                 return 2
             vn = (pc + 8) if rn == 15 else r[rn]
+            scarry = None
             if op_type == 1:
                 imm = ins & 0xFF
                 rot = ((ins >> 8) & 0xF) * 2
@@ -6999,16 +7365,42 @@ class GameBoyAdvance:
             else:
                 rm = ins & 0xF
                 vm = (pc + 8) if rm == 15 else r[rm]
-                sh = (r[(ins >> 8) & 0xF] & 0xFF) if (ins & 0x10) else ((ins >> 7) & 0x1F)
+                reg_sh = bool(ins & 0x10)
+                sh = (r[(ins >> 8) & 0xF] & 0xFF) if reg_sh else ((ins >> 7) & 0x1F)
                 st = (ins >> 5) & 3
-                if st == 0: op2 = (vm << sh) & 0xFFFFFFFF
-                elif st == 1: op2 = (vm >> sh) if sh else 0
+                svm = (vm - 0x100000000) if (vm & 0x80000000) else vm
+                cin = 1 if (self.cpsr & 0x20000000) else 0
+                if reg_sh and sh == 0:
+                    op2 = vm; scarry = cin
+                elif st == 0:
+                    if sh == 0:
+                        op2 = vm; scarry = cin
+                    elif sh < 32:
+                        op2 = (vm << sh) & 0xFFFFFFFF; scarry = (vm >> (32 - sh)) & 1
+                    else:
+                        op2 = 0; scarry = vm & 1
+                elif st == 1:
+                    if sh == 0:
+                        op2 = 0; scarry = (vm >> 31) & 1
+                    elif sh < 32:
+                        op2 = vm >> sh; scarry = (vm >> (sh - 1)) & 1
+                    else:
+                        op2 = 0; scarry = (vm >> 31) & 1
                 elif st == 2:
-                    svm = (vm - 0x100000000) if (vm & 0x80000000) else vm
-                    op2 = (svm >> sh) & 0xFFFFFFFF if sh else (0xFFFFFFFF if svm < 0 else 0)
+                    if sh == 0:
+                        op2 = (0xFFFFFFFF if svm < 0 else 0); scarry = 1 if svm < 0 else 0
+                    elif sh < 32:
+                        op2 = (svm >> sh) & 0xFFFFFFFF; scarry = (svm >> (sh - 1)) & 1
+                    else:
+                        op2 = (0xFFFFFFFF if svm < 0 else 0); scarry = 1 if svm < 0 else 0
                 else:
-                    sh &= 31
-                    op2 = ((vm >> sh) | (vm << (32 - sh))) & 0xFFFFFFFF if sh else vm
+                    if sh == 0:
+                        op2 = ((vm >> 1) | (0x80000000 if cin else 0)) & 0xFFFFFFFF
+                        scarry = vm & 1
+                    else:
+                        sh &= 31
+                        op2 = ((vm >> sh) | (vm << (32 - sh))) & 0xFFFFFFFF if sh else vm
+                        scarry = (vm >> (sh - 1)) & 1
             if opcode == 0x0: res = vn & op2; r[rd] = res
             elif opcode == 0x1: res = vn ^ op2; r[rd] = res
             elif opcode == 0x2: res = (vn - op2) & 0xFFFFFFFF; r[rd] = res
@@ -7016,6 +7408,7 @@ class GameBoyAdvance:
             elif opcode == 0x4: res = (vn + op2) & 0xFFFFFFFF; r[rd] = res
             elif opcode == 0x5: res = (vn + op2 + (1 if (self.cpsr & 0x20000000) else 0)) & 0xFFFFFFFF; r[rd] = res
             elif opcode == 0x6: res = (vn - op2 - (0 if (self.cpsr & 0x20000000) else 1)) & 0xFFFFFFFF; r[rd] = res
+            elif opcode == 0x7: res = (op2 - vn - (0 if (self.cpsr & 0x20000000) else 1)) & 0xFFFFFFFF; r[rd] = res
             elif opcode == 0x8: res = vn & op2
             elif opcode == 0x9: res = vn ^ op2
             elif opcode == 0xA:
@@ -7039,6 +7432,26 @@ class GameBoyAdvance:
                     r[15] = res & ~3
             elif s_bit:
                 self._set_nz(res)
+                cin = 1 if (self.cpsr & 0x20000000) else 0
+                if opcode == 0x4:
+                    c = 1 if (vn + op2) > 0xFFFFFFFF else 0
+                elif opcode == 0x5:
+                    c = 1 if (vn + op2 + cin) > 0xFFFFFFFF else 0
+                elif opcode == 0x2:
+                    c = 1 if vn >= op2 else 0
+                elif opcode == 0x6:
+                    c = 1 if vn >= op2 + (1 - cin) else 0
+                elif opcode == 0x7:
+                    c = 1 if op2 >= vn + (1 - cin) else 0
+                elif opcode == 0xA:
+                    c = 1 if vn >= op2 else 0
+                elif opcode == 0xB:
+                    c = 1 if (vn + op2) > 0xFFFFFFFF else 0
+                elif scarry is not None:
+                    c = scarry
+                else:
+                    c = cin
+                self.cpsr = (self.cpsr & ~0x20000000) | (0x20000000 if c else 0)
         elif op_type in (2, 3):
             rn, rd = (ins >> 16) & 0xF, (ins >> 12) & 0xF
             base = (pc + 8) if rn == 15 else r[rn]
@@ -7310,11 +7723,18 @@ class GameBoyAdvance:
             "sram": bytes(self.sram),
             "buttons": self.buttons, "frames": self.frames,
             "irq_stack": list(self._irq_stack),
+            "eeprom": self._eeprom,
+            "eeprom_cmd": self._eeprom_cmd,
+            "eeprom_read_addr": self._eeprom_read_addr,
+            "eeprom_write_addr": self._eeprom_write_addr,
+            "eeprom_read_bits": self._eeprom_read_bits,
+            "eeprom_data": bytes(self._eeprom_data),
             "boot_anim_frame": self._boot_anim_frame,
             "frame_rgba": self.frame_rgba.copy(),
             # APU DirectSound FIFOs so audio does not glitch on restore
             "gba_fifo_a": bytes(self.apu.gba_fifo_a),
             "gba_fifo_b": bytes(self.apu.gba_fifo_b),
+            "tm_cnt": list(self.tm_cnt),
         }
 
     def restore_state(self, st):
@@ -7332,7 +7752,17 @@ class GameBoyAdvance:
         self.buttons = st.get("buttons", 0)
         self.frames = st.get("frames", self.frames)
         self._irq_stack = list(st.get("irq_stack", []))
+        if "eeprom_data" in st:
+            self._eeprom = st.get("eeprom", self._eeprom)
+            self._eeprom_cmd = st["eeprom_cmd"]
+            self._eeprom_read_addr = st["eeprom_read_addr"]
+            self._eeprom_write_addr = st["eeprom_write_addr"]
+            self._eeprom_read_bits = st["eeprom_read_bits"]
+            self._eeprom_data = bytearray(st["eeprom_data"])
         self._boot_anim_frame = st.get("boot_anim_frame", self._boot_anim_total)
+        if "tm_cnt" in st:
+            self.tm_cnt[:] = st["tm_cnt"]
+        self._sync_gba_timers()
         if "frame_rgba" in st:
             self.frame_rgba[:] = st["frame_rgba"]
         if "gba_fifo_a" in st:
@@ -7367,16 +7797,43 @@ class GameBoyAdvance:
         step = self.step
         for ly in range(228):
             io[6] = ly
+            if io[5] == ly:
+                io[4] |= 0x04
+                if io[4] & 0x20:
+                    io[0x202] |= 0x04
+                    self._take_gba_irq()
+            else:
+                io[4] &= ~0x04
             if ly == 160:
-                io[4] |= 1
-                io[0x202] |= 1
+                io[4] |= 0x01
                 self.iwram[0x7FF8] |= 1
+                self._fire_gba_dma(1)
+                if io[4] & 0x08:
+                    io[0x202] |= 0x01
                 self._take_gba_irq()
             elif ly < 160:
-                io[4] &= ~1
-            for _ in range(260):
+                io[4] &= ~0x01
+            elif ly == 227:
+                io[4] &= ~0x01
+            if ly < 160:
+                io[4] &= ~0x02
+                for _ in range(336):
+                    prev_pc = r[15]
+                    step()
+                    if self._tm_any:
+                        self._tick_gba_timers(1)
+                    if r[15] == prev_pc:
+                        break
+            io[4] |= 0x02
+            self._fire_gba_dma(2)
+            if io[4] & 0x10:
+                io[0x202] |= 0x02
+                self._take_gba_irq()
+            for _ in range(336 if ly >= 160 else 96):
                 prev_pc = r[15]
                 step()
+                if self._tm_any:
+                    self._tick_gba_timers(1)
                 if r[15] == prev_pc:
                     break
         if draw:
@@ -7391,6 +7848,393 @@ class GameBoyAdvance:
 
 # ==========================================================================
 # FAMICOM / FAMICOM DISK SYSTEM (.fds, .fam, .unf) IMPLEMENTATION
+# ==========================================================================
+class _FDSFile:
+    __slots__ = ("num", "name", "addr", "size", "ftype", "data")
+
+    def __init__(self, num, name, addr, size, ftype, data):
+        self.num, self.name = num, name
+        self.addr, self.size, self.ftype = addr, size, ftype
+        self.data = data
+
+
+def _fds_resync(side, pos, want, limit=96):
+    """Skip CRC words / gap bytes until the next block of type `want`."""
+    end = min(len(side), pos + limit)
+    for p in range(pos, end):
+        if side[p] == want:
+            return p
+    return -1
+
+
+def fds_parse_side(side: bytes):
+    """Parse one 65500-byte FDS side in block notation (1=info, 2=file count,
+    3=file header, 4=file data). Tolerates the placeholder CRC words and gap
+    bytes that real dumps keep between blocks; raises on hopeless corruption."""
+    if len(side) < 0x3A or side[0] != 0x01:
+        raise ValueError("side does not start with a disk-info block")
+    if bytes(side[1:15]) != b"*NINTENDO-HVC*":
+        raise ValueError("bad FDS info magic")
+    p = 0x38
+    if _fds_resync(side, p, 0x02) < 0:
+        raise ValueError("file-count block missing")
+    p += 2
+    files = []
+    while len(files) < 256:
+        hp = _fds_resync(side, p, 0x03, 64)
+        if hp < 0:
+            break
+        hdr = side[hp:hp + 0x10]
+        addr = hdr[10] | (hdr[11] << 8)
+        size = hdr[12] | (hdr[13] << 8)
+        ftype = hdr[14]
+        if size == 0 or size > 0x2000 or addr + size > 0x10000 or ftype > 3:
+            raise ValueError("malformed file header")
+        dp = _fds_resync(side, hp + 0x10, 0x04, 8)
+        if dp < 0 or dp > hp + 0x10 + 8:
+            break
+        data = side[dp + 1:dp + 1 + size]
+        if len(data) < size:
+            raise ValueError("file data truncated")
+        files.append(_FDSFile(hdr[1], bytes(hdr[2:10]), addr, size, ftype, bytes(data)))
+        p = dp + 1 + size
+    if not files:
+        raise ValueError("no files on side")
+    return files
+
+
+class _FDSAPU(NESAPU):
+    """2A03 APU with the FDS expansion channel mixed into the output sink."""
+
+    fds = None
+
+    @property
+    def sink(self):
+        base = self._out_sink
+        fds = self.fds
+        if base is None or fds is None:
+            return base
+
+        def mixed(pcm):
+            f = fds.render(len(pcm))
+            if len(f) == 0:
+                return base(pcm)
+            return base(np.clip(pcm.astype(np.int32) + f.astype(np.int32),
+                                -32767, 32767).astype(np.int16))
+
+        return mixed
+
+    @sink.setter
+    def sink(self, fn):
+        self._out_sink = fn
+
+
+class FDSSound:
+    """FDS expansion sound ($4040-$408A): 64-step carrier waveform swept by a
+    32-step modulation table. Ported from the FCEUX/Mednafen hardware model."""
+
+    _BIAS_TAB = (0, 1, 2, 4, 0, -4, -2, -1)
+
+    def __init__(self, sample_rate):
+        self.regs = [0] * 11
+        self.amplitude = [0, 0]
+        self.mwave = [0] * 32
+        self.cwave = [0] * 64
+        self.cwave_freq = 0
+        self.cwave_pos = 0
+        self.mod_freq = 0
+        self.mod_pos = 0
+        self.mod_disabled = 0
+        self.sweep_bias = 0
+        self.mod_out = 0
+        self.cache = 0
+        self.count = 0
+        self.envcount = 0
+        self.env_rate = [0, 0]
+        self.volume = 0.55
+        self._sub_step = ((1 << 40) * (1789772.727272727267 / 2)) / (sample_rate * 16)
+
+    def write_wave(self, a, v):
+        if self.regs[9] & 0x80:
+            self.cwave[a & 0x3F] = v & 0x3F
+
+    def read(self, a):
+        a &= 0xF
+        if a == 0x0:
+            return self.amplitude[0]
+        if a == 0x2:
+            return self.amplitude[1]
+        return 0
+
+    def write(self, a, v):
+        i = a - 0x4080
+        if i == 0x0 or i == 0x4:
+            if v & 0x80:
+                self.amplitude[i >> 2] = v & 0x3F
+        elif i == 0x2:
+            self.cwave_freq = (self.cwave_freq & 0xFF00) | v
+        elif i == 0x3:
+            if not (v & 0x80) and (self.regs[3] & 0x80):
+                self.cwave_pos = 0
+            self.cwave_freq = (self.cwave_freq & 0x00FF) | ((v & 0xF) << 8)
+        elif i == 0x5:
+            self.sweep_bias = (v & 0x7F) << 4
+            self.mod_pos = 0
+        elif i == 0x6:
+            self.mod_freq = (self.mod_freq & 0xFF00) | v
+        elif i == 0x7:
+            self.mod_freq = (self.mod_freq & 0x00FF) | ((v & 0xF) << 8)
+            self.mod_disabled = 1 if (v & 0x80) else 0
+        elif i == 0x8:
+            if self.mod_disabled:
+                for j in range(31):
+                    self.mwave[j] = self.mwave[j + 1]
+                self.mwave[0x1F] = self._BIAS_TAB[v & 7]
+                if (v & 7) == 4:
+                    self.mwave[0x1F] = 0x10
+        self.regs[i] = v
+
+    def _clock_mod(self):
+        if self.mod_disabled:
+            return
+        prev = self.mod_pos
+        self.mod_pos = (self.mod_pos + self.mod_freq) & 0xFFFFFFFF
+        if (self.mod_pos ^ prev) & (0x3F << 11):
+            mw = self.mwave[(self.mod_pos >> 16) & 0x1F]
+            self.sweep_bias = (self.sweep_bias + mw) & 0x7FF
+            if mw == 0x10:
+                self.sweep_bias = 0
+        b = self.sweep_bias - 0x800 if self.sweep_bias & 0x400 else self.sweep_bias
+        temp = b * (0x20 if self.amplitude[1] > 0x20 else self.amplitude[1])
+        if temp & 0x0F0:
+            temp //= 256
+            temp += 2 if not (self.sweep_bias & 0x400) else 0
+            temp -= 1 if (self.sweep_bias & 0x400) else 0
+        else:
+            temp //= 256
+        if temp >= 194:
+            temp -= 258
+        if temp < -64:
+            temp += 256
+        self.mod_out = temp
+
+    def _clock_carrier(self):
+        if not self.mod_disabled:
+            cur = (self.cwave_freq << 6) + self.cwave_freq * self.mod_out
+            if cur < 0:
+                cur = 0
+        else:
+            cur = self.cwave_freq << 6
+        self.cwave_pos = (self.cwave_pos + cur) & 0xFFFFFFFF
+
+    def _do_env(self):
+        if self.regs[3] & 0x40:
+            return
+        for x in range(2):
+            reg = self.regs[x << 2]
+            if reg & 0x80:
+                continue
+            if self.env_rate[x] <= 0:
+                if reg & 0x40:
+                    if self.amplitude[x] < 0x3F:
+                        self.amplitude[x] += 1
+                else:
+                    if self.amplitude[x] > 0:
+                        self.amplitude[x] -= 1
+                self.env_rate[x] = reg & 0x3F
+            else:
+                self.env_rate[x] -= 1
+
+    def _tick(self):
+        regs = self.regs
+        prev_pos = self.cwave_pos
+        self.count += self._sub_step
+        if self.count >= (1 << 40):
+            self.count -= (1 << 40)
+            self._clock_mod()
+            if not (regs[3] & 0x80):
+                self._clock_carrier()
+            self.envcount -= 1
+            if self.envcount <= 0:
+                self.envcount += regs[0xA] * 3
+                self._do_env()
+        if (self.cwave_pos ^ prev_pos) & (1 << 21):
+            k = 0x20 if self.amplitude[0] > 0x20 else self.amplitude[0]
+            if k:
+                self.cache = (self.cwave[(self.cwave_pos >> 21) & 0x3F] * k * 4) / ((regs[9] & 3) + 2)
+
+    def render(self, n):
+        if (self.regs[9] & 0x80) or self.amplitude[0] == 0:
+            return np.zeros(n, dtype=np.int16)
+        out = np.empty(n, dtype=np.float32)
+        tick = self._tick
+        for i in range(n):
+            for _ in range(16):
+                tick()
+            t = int(self.cache)
+            t += t >> 1
+            t >>= 4
+            out[i] = t
+        out = np.clip(out * (32767.0 / 380.0) * self.volume, -32767, 32767)
+        return out.astype(np.int16)
+
+
+class FDSBus(NESBus):
+    """NES bus with the FDS expansion mapped at $4020-$4092 and the 32KB
+    disk-RAM window spanning $6000-$DFFF."""
+
+    def read(self, a):
+        if 0x4020 <= a < 0x4093:
+            return self.fds.read(a)
+        if 0x6000 <= a < 0xE000:
+            return self.prg_ram[a - 0x6000]
+        return super().read(a)
+
+    def write(self, a, v):
+        if 0x4020 <= a < 0x4093:
+            self.fds.write(a, v)
+            return
+        if 0x6000 <= a < 0xE000:
+            self.prg_ram[a - 0x6000] = v
+            return
+        super().write(a, v)
+
+
+class FDSDrive:
+    """Register-accurate FDS drive model (timer IRQ, sequential disk read
+    stream, $4030 status flags, $4032 drive status) following FCEUX."""
+
+    BLOCK_LEN = {1: 0x38, 2: 0x02, 3: 0x10, 4: 0}
+
+    def __init__(self, sides, snd):
+        self.snd = snd
+        self.sides = sides
+        self.in_disk = 255 if not sides else 0
+        self.ctrl = 0
+        self.ctl4023 = 0
+        self.irq_latch = 0
+        self.irq_count = 0
+        self.irq_en = False
+        self.irq_rep = False
+        self.irq_pending = False
+        self.seek_cnt = 0
+        self.seek_irq = False
+        self.block_id = 0
+        self.block_start = 0
+        self.block_len = 0
+        self.disk_pos = 0
+        self.file_size = 0
+        self.written = False
+        self.bus = None
+
+    def read(self, a):
+        a &= 0xFFFF
+        if a == 0x4030:
+            v = self.ctrl & 0x08
+            if self.irq_pending:
+                v |= 1
+            if self.seek_irq:
+                v |= 2
+            self.irq_pending = False
+            self.seek_irq = False
+            self._push_irq()
+            return v
+        if a == 0x4031:
+            if self.in_disk == 255 or not (self.ctrl & 0x04):
+                return 0xFF
+            if self.in_disk < len(self.sides) and self.disk_pos < self.block_len:
+                v = self.sides[self.in_disk][(self.block_start + self.disk_pos) % len(self.sides[self.in_disk])]
+                self.disk_pos += 1
+            else:
+                v = 0xFF
+            self.seek_cnt = 150
+            return v
+        if a == 0x4032:
+            v = 0
+            if self.in_disk == 255:
+                v |= 5
+            elif not (self.ctrl & 1) or (self.ctrl & 2):
+                v |= 2
+            return v
+        if a == 0x4033:
+            return 0x80
+        if 0x4090 <= a < 0x4093:
+            return self.snd.read(a)
+        return 0
+
+    def write(self, a, v):
+        a &= 0xFFFF
+        if a == 0x4020:
+            self.irq_latch = (self.irq_latch & 0xFF00) | v
+        elif a == 0x4021:
+            self.irq_latch = (self.irq_latch & 0xFF) | (v << 8)
+        elif a == 0x4022:
+            if self.ctl4023 & 1:
+                self.irq_rep = bool(v & 0x01)
+                self.irq_en = bool(v & 0x02)
+                if self.irq_en:
+                    self.irq_count = self.irq_latch
+                else:
+                    self.irq_pending = False
+        elif a == 0x4023:
+            if not (v & 0x01):
+                self.irq_en = False
+                self.irq_pending = False
+            self.ctl4023 = v
+        elif a == 0x4024:
+            if self.in_disk != 255 and not (self.ctrl & 0x04) and self.disk_pos < self.block_len:
+                side = bytearray(self.sides[self.in_disk])
+                side[self.block_start + self.disk_pos] = v
+                self.sides[self.in_disk] = bytes(side)
+                self.disk_pos += 1
+                self.written = True
+        elif a == 0x4025:
+            if self.in_disk != 255:
+                if (v & 0x40) and not (self.ctrl & 0x40):
+                    self.block_start += self.disk_pos
+                    self.disk_pos = 0
+                    self.block_id += 1
+                    if self.block_id > 4:
+                        self.block_id = 3
+                    if self.block_id == 4:
+                        self.block_len = 1 + self.file_size
+                    else:
+                        self.block_len = self.BLOCK_LEN.get(self.block_id, 0)
+                if v & 0x02:
+                    self.block_id = 0
+                    self.block_start = 0
+                    self.block_len = 0
+                    self.disk_pos = 0
+                self.seek_cnt = 150
+                self.seek_irq = False
+            self.ctrl = v
+        if 0x4040 <= a < 0x4080:
+            self.snd.write_wave(a, v)
+        elif 0x4080 <= a < 0x408B:
+            self.snd.write(a, v)
+        self._push_irq()
+
+    def tick_line(self):
+        if self.irq_en:
+            self.irq_count -= 113
+            if self.irq_count <= 0:
+                self.irq_count = self.irq_latch
+                self.irq_pending = True
+                if not self.irq_rep:
+                    self.irq_en = False
+            self._push_irq()
+        if self.ctl4023 & 0x02:
+            if self.seek_cnt > 0:
+                self.seek_cnt -= 1
+                if self.seek_cnt <= 0 and (self.ctrl & 0x80):
+                    self.seek_irq = True
+            self._push_irq()
+
+    def _push_irq(self):
+        if self.bus is not None and self.bus.mapper is not None:
+            self.bus.mapper.irq = self.irq_pending or self.seek_irq
+
+
 # ==========================================================================
 class Famicom(NES):
     """Famicom & Famicom Disk System (.fds / .fam / .unf) Console with FDS BIOS/Disk Loader."""
@@ -7410,6 +8254,85 @@ class Famicom(NES):
             super().__init__(rom_path, sample_rate)
 
     def _init_fds(self, rom_path: str, raw: bytes, sample_rate: int):
+        self.rom_path = rom_path
+        disk_data = raw[16:] if raw[:4] == b"FDS\x1a" else raw
+        disk_data = disk_data[:len(disk_data) - (len(disk_data) % 65500)] or disk_data
+        sides = []
+        for i in range(0, len(disk_data), 65500):
+            sides.append(disk_data[i:i + 65500])
+        files = None
+        try:
+            if sides:
+                files = fds_parse_side(sides[0])
+        except (ValueError, IndexError):
+            files = None
+        if files:
+            return self._init_fds_disk(rom_path, sides, files, sample_rate)
+        return self._init_fds_stub(rom_path, raw, sample_rate)
+
+    def _init_fds_disk(self, rom_path, sides, files, sample_rate):
+        self.rom_path = rom_path
+        # HLE of the FDS boot: the BIOS loads file #1 (and any further files
+        # it is asked for) into PRG RAM at the header address, then jumps
+        # into the boot file. Without a disksys.rom this replays that
+        # behavior directly. The system window is filled with RTS so
+        # leftover BIOS calls return cleanly instead of derailing.
+        prg = bytearray(b"\x60" * 32768)
+        # RTI sink at $FFF0 for unclaimed NMI/IRQ
+        prg[0x7FF0] = 0x40
+        prg[0x7FFA:0x8000] = b"\xF0\xFF\xF0\xFF\xF0\xFF"
+        prg_ram = bytearray(32768)
+        boot_addr = None
+        for f in files:
+            if 0x6000 <= f.addr and f.addr + f.size <= 0xE000:
+                prg_ram[f.addr - 0x6000:f.addr - 0x6000 + f.size] = f.data
+                if boot_addr is None and f.num == files[0].num:
+                    boot_addr = f.addr
+        if boot_addr is None and files:
+            boot_addr = files[0].addr
+        if boot_addr is None or boot_addr < 0x6000:
+            boot_addr = 0x6000
+        lo, hi = boot_addr & 0xFF, boot_addr >> 8
+        prg[0x7FFC:0x7FFE] = bytes([lo, hi])
+
+        class _FDSCart:
+            def __init__(c):
+                c.mapper_id = 0
+                c.battery = False
+                c.four_screen = False
+                c.vertical = False
+                c.prg = bytes(prg)
+                c.chr = bytearray(8192)
+                c.chr_ram = True
+                c.prg_ram = prg_ram
+
+        self.cart = _FDSCart()
+        self.mapper = Mapper0(self.cart)
+        self.bus = FDSBus(self.mapper)
+        self.ppu = NESPPU(self.mapper)
+        self.apu = _FDSAPU(self.bus, sample_rate)
+        snd = FDSSound(sample_rate)
+        self.apu.fds = snd
+        self.fds = FDSDrive(sides, snd)
+        self.fds.bus = self.bus
+        self.bus.fds = self.fds
+        self.cpu = CPU6502(self.bus, self.mapper, self.apu)
+        self.pads = [Controller(), Controller()]
+        self.bus.ppu, self.bus.apu, self.bus.cpu, self.bus.pads = self.ppu, self.apu, self.cpu, self.pads
+        self.ppu.cpu = self.cpu
+        self.dot = 0
+        self.apu_mark = 0
+        self.frames = 0
+        map_scan = self.mapper.scanline
+
+        def _fds_scanline():
+            map_scan()
+            self.fds.tick_line()
+
+        self.mapper.scanline = _fds_scanline
+        self.cpu.reset()
+
+    def _init_fds_stub(self, rom_path: str, raw: bytes, sample_rate: int):
         self.rom_path = rom_path
         # Strip 16-byte fwNES header if present ("FDS\x1a")
         disk_data = raw[16:] if raw[:4] == b"FDS\x1a" else raw
@@ -7536,7 +8459,7 @@ class Nintendo64:
         self.frames = 0
         self.frame_rgba = np.zeros((240, 320, 4), dtype=np.uint8)
         self.frame_rgba[:, :, 3] = 255
-        self.apu = SNESAPU(sample_rate, mode="snes")
+        self.apu = SNESAPU(sample_rate, mode="n64")
         self._load_battery()
         self.reset()
 
@@ -7973,6 +8896,17 @@ class Nintendo64:
         if 0x04500000 <= p < 0x04500020:
             idx = (p >> 2) & 7
             self.ai_regs[idx] = val
+            if idx == 1 and val >= 4:
+                # AI streams raw 16-bit stereo PCM from RDRAM at AI_DRAM_ADDR;
+                # DAC frequency = VI clock / (AI_DACRATE + 1).
+                addr = self.ai_regs[0] & 0x007FFFF8
+                ln = min(val, len(self.rdram) - addr)
+                if ln > 16:
+                    pcm = np.frombuffer(bytes(self.rdram[addr:addr + ln]), dtype="<u2")
+                    dac = self.ai_regs[2]
+                    rate = 48681812.0 / (dac + 1) if dac else 44100.0
+                    rate = min(max(rate, 8000.0), 96000.0)
+                    self.apu.push_n64(pcm, rate)
             if idx in (0, 1) and val:  # AI length write: DMA completes, IRQ audio thread
                 self.mi_regs[2] |= 0x04
                 self._mi_update()
@@ -8312,6 +9246,12 @@ class Nintendo64:
     def _edge(ax, ay, bx, by, cx, cy):
         return (cx - ax) * (by - ay) - (cy - ay) * (bx - ax)
 
+    @staticmethod
+    def _row_mask(row_any):
+        if row_any is None:
+            return None
+        return row_any[:, 0] if row_any.ndim == 2 and row_any.shape[1] == 1 else row_any
+
     def _render_frame(self):
         fb = self.frame_rgba
         rsp = self._rsp_fb
@@ -8343,8 +9283,9 @@ class Nintendo64:
         if rsp_has:
             fb[:] = rsp
             fb[:, :, 3] = 255
-            if row_any is not None and row_any.any():
-                fb[:, :, :3][row_any] = vi_rgb[row_any]
+            rows = self._row_mask(row_any)
+            if rows is not None and row_any.any():
+                fb[:, :, :3][rows] = vi_rgb[rows]
             return
         if row_any is not None and row_any.all():
             if bpp32:
@@ -8358,6 +9299,8 @@ class Nintendo64:
             return
         if row_any is not None and row_any.any():
             empt = ~row_any[:, 0] if row_any.shape[1] == 1 else ~row_any.any(axis=1)
+            if row_any.shape[1] == 1:
+                row_any = row_any[:, 0]
             if bpp32:
                 fb[:, :, :3][row_any] = arr[:, :, :3][row_any]
             else:
