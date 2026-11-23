@@ -3736,6 +3736,7 @@ class CPU65c816:
         f8 = self._fetch8
         f16 = self._fetch16
         rd = self.bus.read
+        wr = self.bus.write
         cpu = self
 
         handlers = {}
@@ -3774,7 +3775,15 @@ class CPU65c816:
             else:
                 m = f16(); cpu.a = m; nz16(m)
 
-        def lda_dp(): cpu._lda_val(0, (cpu.d + f8()) & 0xFFFF)
+        def lda_dp():
+            ad = (cpu.d + f8()) & 0xFFFF
+            if cpu.m_flag:
+                v = rd(0, ad)
+                cpu.a = (cpu.a & 0xFF00) | v; nz8(v)
+            else:
+                v = cpu._read16(0, ad)
+                cpu.a = v; nz16(v)
+
         def lda_dpx(): cpu._lda_val(0, (cpu.d + f8() + cpu.x) & 0xFFFF)
 
         def lda_abs():
@@ -3791,7 +3800,13 @@ class CPU65c816:
             full = ((cpu.dbr << 16) + ad + cpu.y) & 0xFFFFFF
             cpu._lda_val(full >> 16, full & 0xFFFF)
 
-        def sta_dp(): cpu._sta_val(0, (cpu.d + f8()) & 0xFFFF)
+        def sta_dp():
+            ad = (cpu.d + f8()) & 0xFFFF
+            if cpu.m_flag:
+                wr(0, ad, cpu.a & 0xFF)
+            else:
+                cpu._write16(0, ad, cpu.a)
+
         def sta_dpx(): cpu._sta_val(0, (cpu.d + f8() + cpu.x) & 0xFFFF)
 
         def sta_abs():
@@ -6460,13 +6475,19 @@ class GameBoyAdvance:
                     | (b[(addr + 2) & 1023] << 16) | (b[(addr + 3) & 1023] << 24))
         if region == 6:
             b = self.vram
-            vals = []
-            for i in range(4):
-                a = (addr + i) & 0x1FFFF
-                if a >= 0x18000:
-                    a = 0x10000 | (a & 0x7FFF)
-                vals.append(b[a])
-            return vals[0] | (vals[1] << 8) | (vals[2] << 16) | (vals[3] << 24)
+            a0 = addr & 0x1FFFF
+            if a0 >= 0x18000:
+                a0 = 0x10000 | (a0 & 0x7FFF)
+            a1 = a0 + 1
+            if a1 >= 0x18000:
+                a1 = 0x10000 | (a1 & 0x7FFF)
+            a2 = a0 + 2
+            if a2 >= 0x18000:
+                a2 = 0x10000 | (a2 & 0x7FFF)
+            a3 = a0 + 3
+            if a3 >= 0x18000:
+                a3 = 0x10000 | (a3 & 0x7FFF)
+            return b[a0] | (b[a1] << 8) | (b[a2] << 16) | (b[a3] << 24)
         if region == 7:
             b = self.oam
             return (b[addr & 1023] | (b[(addr + 1) & 1023] << 8)
