@@ -1,3 +1,3 @@
 --no-build-isolation --force-reinstall "git+https://github.com/python-cffi/cffi.git"
 --no-build-isolation pymunk==6.9.0
-pip install arcade numpy imageio imageio-ffmpeg sounddevice pillow
+pip install arcade numpy imageio imageio-ffmpeg sounddevice pillow pysdl2 pysdl3

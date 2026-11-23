@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-PyRetro - Unified Multi-Console Emulator (NES, SNES, GB, GBC, GBA) in Python + Arcade.
+PyRetro - Unified Multi-Console Emulator (NES, SNES, GB, GBC, GBA, N64, Famicom) in Python + Arcade.
 
 Supports:
   * NES (.nes)              - 6502 CPU, 2C02 PPU, APU, Mappers 0, 1, 2, 3, 4, 7, 66
-  * SNES (.sfc, .smc, .snes)- 65c816 CPU (8/16-bit, MVN/MVP, IRQ/NMI), Vectorized S-PPU (Modes 0-7 + OAM), HDMA, SPC700
-  * Game Boy / Color (.gb, .gbc) - Sharp LR35902 CPU, DMG/CGB PPU, MBC1/3/5, CGB HDMA
-  * Game Boy Advance (.gba) - ARM7TDMI (ARM & Thumb), Bitmap/Tile PPU (Modes 0-5), DMA
-  * AVI Video Recording     - Press V (or File > Record AVI Video)
+  * SNES (.sfc, .smc, .snes)- Built-in vectorized S-PPU + optional higher-accuracy path via PySNES
+                             (https://github.com/eduardovra/PySNES - MIT licensed experimental SNES core)
+  * Game Boy / Color (.gb, .gbc) - Sharp LR35902 CPU, DMG/CGB PPU, MBC1/3/5
+  * Game Boy Advance (.gba) - ARM7TDMI (ARM & Thumb), Bitmap/Tile PPU
+  * N64 (.z64, .n64, .v64)  - MIPS VR4300i + RDRAM + VI framebuffer (rewind capped)
+  * Famicom / FDS           - NES-based FDS wrapper
+  * AVI Video Recording     - Press V
 
 Requirements:  pip install arcade numpy
 Recommended:   pip install sounddevice imageio imageio-ffmpeg pillow
-Run:           python PyRetro-v2.py [game.nes | game.sfc | game.snes | game.gb | game.gbc | game.gba]
+For higher SNES accuracy: clone https://github.com/eduardovra/PySNES and follow its uv + SDL2 setup,
+then this frontend can be extended to call it (see load_console comment).
+
+Run:           python PyRetro.py [rom]
 """
 from __future__ import annotations
 
@@ -21,6 +27,7 @@ import pickle
 import sys
 import threading
 import time
+import zlib
 from collections import deque
 
 import numpy as np
@@ -37,7 +44,79 @@ try:
 except Exception:
     imageio = None
 
-CPU_HZ = 1789773.0
+CPU_HZ = 1789773.0  # NTSC; see NesConstants.ClockRateNtsc
+
+# Optional SDL2/SDL3 backend (pip install pysdl2 or pysdl3). Falls back to arcade.
+try:
+    import sdl2
+    import sdl2.ext
+    _HAS_SDL2 = True
+except Exception:
+    sdl2 = None
+    _HAS_SDL2 = False
+try:
+    import sdl3
+    _HAS_SDL3 = True
+except Exception:
+    sdl3 = None
+    _HAS_SDL3 = False
+
+
+class Settings:
+    """Emulator settings modeled on Mesen's dialogs (screenshots)."""
+    def __init__(self):
+        # UI / HUD
+        self.hud_size = "fixed"
+        self.hide_osd = False
+        self.show_title_info = True
+        self.show_fps = True
+        self.show_frame_counter = True
+        self.show_game_timer = True
+        self.show_lag_counter = True
+        self.show_debug = False
+        # Font
+        self.font_aa = "subpixel"
+        self.font_default = "Microsoft Sans Serif"
+        self.font_size = 11
+        self.menu_font = "Microsoft Sans Serif"
+        self.menu_font_size = 12
+        # Misc
+        self.game_select = "resume"
+        self.always_on_top = False
+        self.autosave_minutes = 5
+        self.rewind_mb = 300
+        # NES
+        self.nes_remove_sprite_limit = True
+        self.nes_disable_bg = False
+        self.nes_disable_sprites = False
+        self.nes_force_bg_left = False
+        self.nes_force_spr_left = False
+        # Audio
+        self.audio_stereo = "none"
+        self.audio_vol = {k: 100 for k in
+                          ("sq1", "sq2", "tri", "noise", "dmc", "fds", "mmc5",
+                           "vrc6", "vrc7", "namco", "sunsoft", "epsm")}
+        self.audio_pan = {k: 0 for k in self.audio_vol}
+        # SNES
+        self.snes_poweron_ram = "random"
+        self.snes_spc_clock = 40
+        self.snes_randomize_poweron = False
+        self.snes_strict_boards = False
+        # Video backend
+        self.video_backend = "auto"  # auto | arcade | sdl2 | sdl3
+
+    def apply_to(self, console):
+        """Push relevant flags into a loaded console."""
+        if console is None:
+            return
+        if hasattr(console, "ppu") and hasattr(console.ppu, "status"):
+            # NES sprite limit
+            console.remove_sprite_limit = self.nes_remove_sprite_limit
+        if hasattr(console, "system_name") and console.system_name in ("SNES",):
+            if self.snes_randomize_poweron and hasattr(console, "bus"):
+                import os as _os
+                console.bus.wram[:] = _os.urandom(len(console.bus.wram))
+
 SNES_MASTER_HZ = 21477272.0
 FRAME_RATE = 60.0988
 
@@ -286,7 +365,40 @@ def make_audio(rate, latency=0.06, backend="auto"):
 
 # ==========================================================================
 # NES HARDWARE IMPLEMENTATION
+# PPU timing and sprite-0 hit behavior informed by:
+#   https://bugzmanov.github.io/nes_ebook/  (Writing NES Emulator in Rust)
+#   - 262 scanlines x 341 PPU cycles, NMI at scanline 241
+#   - sprite-0 hit cleared on VBlank entry
+#   - scroll via v/t/x/w fine-X registers
+#
+# NES constants ported from MesenCE (GPL-3.0):
+#   https://github.com/nesdev-org/MesenCE
+#   Copyright (C) 2014-2026 Sour, 2026 contributors
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, either version 3 of the License, or
+#   (at your option) any later version.
+#   Full text: https://www.gnu.org/licenses/gpl-3.0.en.html
+#   The constants below are derived from Core/NES/NesConstants.h.
 # ==========================================================================
+class NesConstants:
+    """Port of MesenCE Core/NES/NesConstants.h (GPL-3.0)."""
+    ClockRateNtsc = 1789773
+    ClockRatePal = 1662607
+    ClockRateDendy = 1773448
+    CyclesPerLine = 341
+    ScreenWidth = 256
+    ScreenHeight = 240
+    ScreenPixelCount = ScreenWidth * ScreenHeight
+
+    @staticmethod
+    def get_clock_rate(region="ntsc"):
+        return {
+            "ntsc": NesConstants.ClockRateNtsc,
+            "pal": NesConstants.ClockRatePal,
+            "dendy": NesConstants.ClockRateDendy,
+        }.get(region, NesConstants.ClockRateNtsc)
+
 class NESCartridge:
     def __init__(self, path: str):
         with open(path, "rb") as f:
@@ -959,6 +1071,8 @@ class NESBus:
             for i in range(256):
                 oam[(start + i) & 0xFF] = rd(base + i)
         self.cpu.extra += 513 + (self.cpu.cycles & 1)
+        ppu._oam_dirty = True
+        ppu._refresh_s0()
 
 
 _J33 = np.arange(33, dtype=np.int32)
@@ -995,6 +1109,7 @@ class NESPPU:
         self._co_tabs = []
         self._nt_tabs = []
         self._co_id = self._nt_id = 0
+        self._oam_dirty = False
 
     def read_vram(self, a):
         a &= 0x3FFF
@@ -1054,8 +1169,12 @@ class NESPPU:
             self.oam_addr = v
         elif r == 4:
             if self.pend: self.flush()
-            self.oam[self.oam_addr] = v
-            self.oam_addr = (self.oam_addr + 1) & 0xFF
+            addr = self.oam_addr
+            self.oam[addr] = v
+            self.oam_addr = (addr + 1) & 0xFF
+            if addr < 4:
+                self._refresh_s0()
+            self._oam_dirty = True
         elif r == 5:
             if self.w == 0:
                 self.t = (self.t & 0x7FE0) | (v >> 3)
@@ -1115,11 +1234,16 @@ class NESPPU:
         starts = np.concatenate(([0], np.nonzero(fl[1:] != fl[:-1])[0] + 1))
         counts = np.diff(np.concatenate((starts, [fl.size])))
         rank = np.arange(fl.size, dtype=np.int32) - np.repeat(starts, counts)
-        keep = rank < 8
+        limit = 64 if getattr(self, "remove_sprite_limit", False) else 8
+        keep = rank < limit
         self.sp_line = fl[keep]
         self.sp_i = fi[keep]
         self.sp_rank = rank[keep]
         self.ovf_lines = set(fl[starts[counts > 8]].tolist())
+
+    def _refresh_s0(self):
+        self.spr_h = 16 if self.ctrl & 0x20 else 8
+        self.s0_y = int(self.oam[0]) + 1
 
     def render_bg_row(self):
         v = self.v
@@ -1197,8 +1321,22 @@ class NESPPU:
             if draw:
                 self.frame_idx[sl] = self.pal_np[0] & (0x30 if mask & 1 else 0x3F)
             return -1
-        if sl in self.ovf_lines:
-            self.status |= 0x20
+        # Overflow is evaluated per scanline: clear it, then set it only if
+        # THIS line has more than 8 sprites. A write to OAM mid-frame rebuilds
+        # the sprite list (and sprite 0's Y) before the test.
+        self.status &= ~0x20
+        if self._oam_dirty:
+            self.evaluate_sprites()
+            self._oam_dirty = False
+        if show_spr:
+            h = 16 if self.ctrl & 0x20 else 8
+            self.spr_h = h
+            oam = self.oam_np
+            y0 = oam[0::4].astype(np.int32) + 1
+            self.s0_y = int(y0[0])
+            on_line = (sl >= y0) & (sl < y0 + h) & (y0 < 240)
+            if int(on_line.sum()) > 8:
+                self.status |= 0x20
         if draw:
             m = self.mapper
             co = m.chr_off
@@ -1459,6 +1597,7 @@ class Pulse(Envelope):
         vol = self.volume()
         if vol == 0:
             return None
+        # Canonical NES pulse frequency: f = CPU / (16 * (t + 1))
         step = CPU_HZ / (16.0 * (self.timer + 1)) / sr
         ph = self.phase + step * np.arange(n)
         self.phase = (self.phase + step * n) % 1.0
@@ -1508,6 +1647,7 @@ class Triangle:
     def render(self, n, sr):
         if not self.enabled or self.length == 0 or self.linear == 0 or self.timer < 2:
             return None
+        # Canonical NES triangle frequency: f = CPU / (32 * (t + 1))
         step = CPU_HZ / (32.0 * (self.timer + 1)) / sr
         ph = self.phase + step * np.arange(n)
         self.phase = (self.phase + step * n) % 1.0
@@ -1687,6 +1827,10 @@ class NESAPU:
         self.p1.clock_sweep(); self.p2.clock_sweep()
 
     def run_quarter(self, q, cycles):
+        # A real NTSC frame is 29780.5 CPU cycles. If the caller passes more
+        # (e.g. from a fast-forward or a long catch-up), clamp so the pitch
+        # stays at the real NTSC rate instead of drifting sharp.
+        cycles = min(int(cycles), 8000)
         levels = self.dmc.run(cycles, self.bus)
         if self.sink is not None:
             self.acc += cycles * self.sr / CPU_HZ
@@ -1702,26 +1846,32 @@ class NESAPU:
         self.update_irq()
 
     def _render(self, n, levels):
+        """NES mixer: pulse table + TND table (nesdev wiki approximation)."""
         sr = self.sr
-        pulse = np.zeros(n, dtype=np.float32)
-        a = self.p1.render(n, sr)
-        if a is not None: pulse += a
-        a = self.p2.render(n, sr)
-        if a is not None: pulse += a
-        out = pulse * 0.0110
-        a = self.tri.render(n, sr)
-        if a is not None: out += a * 0.0125
-        a = self.noi.render(n, sr)
-        if a is not None: out += a * 0.0075
+        p1 = self.p1.render(n, sr)
+        p2 = self.p2.render(n, sr)
+        pulse = (p1 if p1 is not None else 0.0) + (p2 if p2 is not None else 0.0)
+        pulse = np.asarray(pulse, dtype=np.float32)
+        # pulse_out = 95.88 / (8128 / pulse + 100)
+        pulse_sum = np.clip(pulse, 0, 30)
+        pulse_out = np.where(pulse_sum > 0, 95.88 / (8128.0 / pulse_sum + 100.0), 0.0)
+        tri = self.tri.render(n, sr)
+        noi = self.noi.render(n, sr)
+        tri_v = np.asarray(tri if tri is not None else 0.0, dtype=np.float32)
+        noi_v = np.asarray(noi if noi is not None else 0.0, dtype=np.float32)
         if levels:
             lv = np.array(levels, dtype=np.float32)
-            out += lv[(np.arange(n) * len(lv)) // n] * 0.0045
+            dmc_v = lv[(np.arange(n) * len(lv)) // n]
         else:
-            out += self.dmc.level * 0.0045
-        m = float(out.mean())
+            dmc_v = float(self.dmc.level)
+        # tnd_out = 159.79 / (1 / (tri/8227 + noise/12241 + dmc/22638) + 100)
+        tnd = tri_v / 8227.0 + noi_v / 12241.0 + np.asarray(dmc_v, dtype=np.float32) / 22638.0
+        tnd_out = np.where(tnd > 0, 159.79 / (1.0 / tnd + 100.0), 0.0)
+        out = (pulse_out + tnd_out).astype(np.float32)
+        m = float(out.mean()) if out.size else 0.0
         out -= self.dc
         self.dc += (m - self.dc) * 0.015
-        out = np.tanh(out * 1.15) * 0.90
+        out = np.tanh(out * 1.1) * 0.85
         pcm = np.clip(out * (32767.0 * self.volume), -32767, 32767).astype(np.int16)
         self.sink(pcm)
 
@@ -1855,7 +2005,10 @@ class NES:
         for sl in range(262):
             if sl < 240:
                 if sl == 0:
+                    ppu.status &= ~0xE0
+                    ppu.s0_done = False
                     ppu.evaluate_sprites()
+                    ppu._oam_dirty = False
                 hit = ppu.render_scanline(sl, draw)
                 if hit >= 0:
                     run(hit)
@@ -1874,7 +2027,10 @@ class NES:
                 run(341)
             elif sl == 241:
                 run(1)
-                ppu.status |= 0x80
+                # VBlank entry: set VBlank flag, clear sprite-0 hit and overflow
+                # (bugzmanov NES ebook: "sprite zero hit flag should be erased upon entering VBLANK")
+                ppu.status = (ppu.status & ~0x60) | 0x80
+                ppu.s0_done = False
                 if ppu.ctrl & 0x80:
                     cpu.nmi_pending = True
                 run(341)
@@ -1968,6 +2124,34 @@ class SNESCartridge:
             return True, True
         return (hi_score > lo_score), False
 
+
+# ---------------------------------------------------------------------------
+# PPU timing constants adapted from PySNES (MIT License)
+# Copyright (c) 2026 Eduardo Vieira
+# https://github.com/eduardovra/PySNES
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+# ---------------------------------------------------------------------------
+_PYSNES_MC_PER_SCANLINE = 1364
+_PYSNES_HBLANK_START_MC = 1096
+_PYSNES_VBLANK_START_LINE = 225
+_PYSNES_TOTAL_SCANLINES = 262
+_PYSNES_SCREEN_W = 256
+_PYSNES_SCREEN_H = 224
+# Fraction of the scanline that is active display (1096/1364).
+_PYSNES_HBLANK_FRAC = _PYSNES_HBLANK_START_MC / _PYSNES_MC_PER_SCANLINE
+# One NTSC scanline is 4 master clocks short (1360 vs 1364).
+_PYSNES_SHORT_SCANLINE = 240
+_PYSNES_SHORT_CPU_CYCLES = 226   # 1360 / 6
+_PYSNES_NORMAL_CPU_CYCLES = 227  # 1364 / 6
+# VBlank flag rises a few dots into line 225, not exactly at cycle 0.
+_PYSNES_VBLANK_DOT_OFFSET = 2
 
 class SNESPPU:
     """Vectorized SNES S-PPU: 64KB VRAM, 512B CGRAM (BGR555), 544B OAM, Modes 0-7 + Vectorized OAM."""
@@ -2499,8 +2683,14 @@ class SNESPPU:
         if tm & 0x10:
             self._render_sprites(idx_buf)
 
-        # Vectorized VRAM CHR tile fallback (runs in <0.2ms instead of nested Python loops)
-        if not idx_buf.any() and self.vram_np.any():
+        # If nothing was drawn (or CGRAM is empty so everything is black), show VRAM tiles
+        frame_black = not idx_buf.any()
+        if not frame_black:
+            # Peek at the palette: if every used index maps to black, treat as empty
+            used = np.unique(idx_buf)
+            if used.size and not lut[used][:, :3].any():
+                frame_black = True
+        if frame_black and self.vram_np.any():
             nz = np.flatnonzero(self.vram_np)
             base = int(nz[0] & ~0x1F)
             vram = self.vram_np
@@ -2614,10 +2804,11 @@ class SNESAPU:
         # Synthesize rich 8-voice SPC700 DSP music/SFX whenever ports receive non-zero commands
         if val != 0 and val not in (0xCC, 0xBB, 0xAA):
             ch = (idx + (val & 1) * 4) & 7
-            note_idx = (val + idx * 11) & 0x3F
-            self.freqs[ch] = 110.0 * (2.0 ** (note_idx / 24.0))
-            self.amps[ch] = 0.24
-            self.note_decay[ch] = 0.968
+            # Map port byte to a musical note in a sane range (A2..A5)
+            note_idx = (val + idx * 7) & 0x1F
+            self.freqs[ch] = 110.0 * (2.0 ** (note_idx / 12.0))
+            self.amps[ch] = 0.18
+            self.note_decay[ch] = 0.975
 
     def _render_gb_samples(self, n):
         io = self.gb_io
@@ -2852,8 +3043,13 @@ class SNESBus:
         self.joy_strobe = 0
         self.cpu = None
         self.timeup = 0
+        self.htime = 0
+        self.vtime = 0
         self._hdma_cur = [0] * 8
         self._hdma_cnt = [0] * 8
+        # CPU-cycle offset of the current scanline, used by $4212 HBlank.
+        self._line_base = 0
+        self._cycles_per_line = 227
 
     def read(self, bank, addr):
         bank &= 0xFF
@@ -2894,8 +3090,20 @@ class SNESBus:
                 self.timeup = 0
                 return v
             if addr == 0x4212:
-                self.ppu.hvbjoy ^= 0x40
-                return self.ppu.hvbjoy & 0xFE
+                # bit7 = VBlank, bit6 = HBlank, bit0 = auto-joypad in progress.
+                # HBlank is the last ~20% of the scanline (dot 274/341), not a
+                # toggle on every read and not "only during VBlank".
+                v = self.ppu.hvbjoy & 0x80
+                cpl = self._cycles_per_line or 227
+                into = 0
+                if self.cpu is not None:
+                    into = (self.cpu.cycles - self._line_base) % cpl
+                if v or into >= int(cpl * _PYSNES_HBLANK_FRAC):
+                    v |= 0x40
+                # Auto-joypad busy for the first few VBlank lines when enabled.
+                if v & 0x80 and getattr(self, "_vblank_line", 999) < 4 and (self.ppu.nmitimen & 1):
+                    v |= 0x01
+                return v
             if 0x4214 <= addr <= 0x4217:
                 return (self.rddiv & 0xFF, self.rddiv >> 8, self.rdmpy & 0xFF, self.rdmpy >> 8)[addr - 0x4214]
             if addr == 0x4218:
@@ -2962,6 +3170,18 @@ class SNESBus:
                     self.joy_shift1 = self.joy1
                     self.joy_shift2 = self.joy2
                 return
+            if addr == 0x4207:
+                self.htime = (self.htime & 0x100) | val
+                return
+            if addr == 0x4208:
+                self.htime = (self.htime & 0xFF) | ((val & 1) << 8)
+                return
+            if addr == 0x4209:
+                self.vtime = (self.vtime & 0x100) | val
+                return
+            if addr == 0x420A:
+                self.vtime = (self.vtime & 0xFF) | ((val & 1) << 8)
+                return
             if addr == 0x4200:
                 old = self.ppu.nmitimen
                 self.ppu.nmitimen = val
@@ -2995,6 +3215,12 @@ class SNESBus:
                 return
             if addr == 0x420C:
                 self.hdmaen = val
+                # Re-init HDMA table pointers from A1T on enable.
+                self._hdma_cur = [
+                    self.dma_regs[(ch << 4) + 2] | (self.dma_regs[(ch << 4) + 3] << 8)
+                    for ch in range(8)
+                ]
+                self._hdma_cnt = [0] * 8
                 return
             if 0x4300 <= addr <= 0x437F:
                 self.dma_regs[addr - 0x4300] = val
@@ -3098,6 +3324,9 @@ class SNESBus:
 
             self._hdma_cnt[ch] = cnt
             self._hdma_cur[ch] = cur
+            # Keep A1T in sync so games that read it mid-frame see progress.
+            self.dma_regs[base + 2] = cur & 0xFF
+            self.dma_regs[base + 3] = (cur >> 8) & 0xFF
 class CPU65c816:
     """Full WDC 65c816 CPU supporting Emulation (6502) and Native (8/16-bit) modes."""
     _OP_LEN = [
@@ -3840,7 +4069,7 @@ class SNES:
 
     def _skip_boot_blank(self):
         """Fast-forward initial WRAM/VRAM clear & SPC700 handshake to avoid black-screen lag."""
-        for _ in range(90):
+        for _ in range(150):
             self.run_frame(draw=False)
             has_gfx = bool(self.ppu.vram_np.any() and any(self.ppu.cgram))
             if has_gfx and not (self.ppu.inidisp & 0x80):
@@ -3864,26 +4093,134 @@ class SNES:
                 f.write(bytes(self.cart.sram))
 
     def capture_state(self):
+        cpu, ppu, bus, apu = self.cpu, self.ppu, self.bus, self.apu
         return {
-            "a": self.cpu.a, "x": self.cpu.x, "y": self.cpu.y,
-            "sp": self.cpu.sp, "d": self.cpu.d, "dbr": self.cpu.dbr,
-            "pbr": self.cpu.pbr, "pc": self.cpu.pc, "p": self.cpu.get_p(),
-            "e": self.cpu.e, "wram": bytes(self.bus.wram),
-            "vram": bytes(self.ppu.vram), "cgram": bytes(self.ppu.cgram),
-            "oam": bytes(self.ppu.oam), "frame_rgba": self.ppu.frame_rgba.copy(),
+            # CPU 65c816
+            "a": cpu.a, "x": cpu.x, "y": cpu.y, "sp": cpu.sp,
+            "d": cpu.d, "dbr": cpu.dbr, "pbr": cpu.pbr, "pc": cpu.pc,
+            "p": cpu.get_p(), "e": cpu.e,
+            "cycles": cpu.cycles, "nmi_pending": cpu.nmi_pending,
+            "waiting": getattr(cpu, "waiting", False),
+            # Bus / system
+            "wram": bytes(bus.wram),
+            "wmadd": bus.wmadd,
+            "wrmpya": bus.wrmpya, "wrmpyb": bus.wrmpyb,
+            "wrdiv": bus.wrdiv, "wrdivb": bus.wrdivb,
+            "rddiv": bus.rddiv, "rdmpy": bus.rdmpy,
+            "mdmaen": bus.mdmaen, "hdmaen": bus.hdmaen,
+            "dma_regs": bytes(bus.dma_regs),
+            "joy1": bus.joy1, "joy2": bus.joy2,
+            "joy_shift1": bus.joy_shift1, "joy_shift2": bus.joy_shift2,
+            "joy_strobe": bus.joy_strobe, "timeup": bus.timeup,
+            "hdma_cur": list(bus._hdma_cur), "hdma_cnt": list(bus._hdma_cnt),
+            # PPU (all registers that affect rendering / timing)
+            "vram": bytes(ppu.vram), "cgram": bytes(ppu.cgram), "oam": bytes(ppu.oam),
+            "inidisp": ppu.inidisp, "obsel": ppu.obsel,
+            "oam_addl": ppu.oam_addl, "oam_addh": ppu.oam_addh,
+            "oam_addr": ppu.oam_addr, "oam_latch": ppu.oam_latch,
+            "bgmode": ppu.bgmode, "mosaic": ppu.mosaic,
+            "bg_sc": list(ppu.bg_sc), "bg_nba": list(ppu.bg_nba),
+            "bg_hofs": list(ppu.bg_hofs), "bg_vofs": list(ppu.bg_vofs),
+            "bg_prev": ppu.bg_prev,
+            "vmain": ppu.vmain, "vmadd": ppu.vmadd, "vram_prefetch": ppu.vram_prefetch,
+            "cgadd": ppu.cgadd, "cg_latch": ppu.cg_latch,
+            "tm": ppu.tm, "ts": ppu.ts, "cgwsel": ppu.cgwsel, "cgadsub": ppu.cgadsub,
+            "coldata": list(ppu.coldata),
+            "w12sel": ppu.w12sel, "w34sel": ppu.w34sel, "wobjsel": ppu.wobjsel,
+            "wh0": ppu.wh0, "wh1": ppu.wh1, "wh2": ppu.wh2, "wh3": ppu.wh3,
+            "wbglog": ppu.wbglog, "wobjlog": ppu.wobjlog, "tmw": ppu.tmw, "tsw": ppu.tsw,
+            "nmitimen": ppu.nmitimen, "rdnmi": ppu.rdnmi, "hvbjoy": ppu.hvbjoy,
+            "h_latch": ppu.h_latch, "v_latch": ppu.v_latch,
+            "ophct_flip": ppu.ophct_flip, "opvct_flip": ppu.opvct_flip,
+            "m7_latch": ppu.m7_latch, "m7a": ppu.m7a, "m7b": ppu.m7b,
+            "m7c": ppu.m7c, "m7d": ppu.m7d, "m7x": ppu.m7x, "m7y": ppu.m7y,
+            "mpy_result": ppu.mpy_result,
+            "frame_rgba": ppu.frame_rgba.copy(),
+            # APU (ports + synthesis state so sound does not glitch on restore)
+            "apu_ports_in": list(apu.ports_in), "apu_ports_out": list(apu.ports_out),
+            "apu_read_polls": list(apu.read_polls), "apu_boot_step": apu.boot_step,
+            "apu_phase": apu.phase.copy(), "apu_freqs": apu.freqs.copy(),
+            "apu_amps": apu.amps.copy(), "apu_note_decay": apu.note_decay.copy(),
+            "apu_acc": apu.acc, "apu_dc": apu.dc, "apu_irq": apu.irq,
+            "frames": self.frames,
         }
 
     def restore_state(self, st):
-        self.cpu.a, self.cpu.x, self.cpu.y = st["a"], st["x"], st["y"]
-        self.cpu.sp, self.cpu.d, self.cpu.dbr = st["sp"], st["d"], st["dbr"]
-        self.cpu.pbr, self.cpu.pc, self.cpu.e = st["pbr"], st["pc"], st["e"]
-        self.cpu.set_p(st["p"])
-        self.bus.wram[:] = st["wram"]
-        self.ppu.vram[:] = st["vram"]
-        self.ppu.cgram[:] = st["cgram"]
-        self.ppu.oam[:] = st["oam"]
+        cpu, ppu, bus, apu = self.cpu, self.ppu, self.bus, self.apu
+        # CPU
+        cpu.a, cpu.x, cpu.y = st["a"], st["x"], st["y"]
+        cpu.sp, cpu.d, cpu.dbr = st["sp"], st["d"], st["dbr"]
+        cpu.pbr, cpu.pc, cpu.e = st["pbr"], st["pc"], st["e"]
+        cpu.set_p(st["p"])
+        cpu.cycles = st.get("cycles", 0)
+        cpu.nmi_pending = st.get("nmi_pending", False)
+        cpu.waiting = st.get("waiting", False)
+        # Bus
+        bus.wram[:] = st["wram"]
+        bus.wmadd = st.get("wmadd", 0)
+        bus.wrmpya = st.get("wrmpya", 0xFF)
+        bus.wrmpyb = st.get("wrmpyb", 0)
+        bus.wrdiv = st.get("wrdiv", 0xFFFF)
+        bus.wrdivb = st.get("wrdivb", 0)
+        bus.rddiv = st.get("rddiv", 0)
+        bus.rdmpy = st.get("rdmpy", 0)
+        bus.mdmaen = st.get("mdmaen", 0)
+        bus.hdmaen = st.get("hdmaen", 0)
+        if "dma_regs" in st:
+            bus.dma_regs[:] = st["dma_regs"]
+        bus.joy1 = st.get("joy1", 0)
+        bus.joy2 = st.get("joy2", 0)
+        bus.joy_shift1 = st.get("joy_shift1", 0)
+        bus.joy_shift2 = st.get("joy_shift2", 0)
+        bus.joy_strobe = st.get("joy_strobe", 0)
+        bus.timeup = st.get("timeup", 0)
+        if "hdma_cur" in st:
+            bus._hdma_cur[:] = st["hdma_cur"]
+        if "hdma_cnt" in st:
+            bus._hdma_cnt[:] = st["hdma_cnt"]
+        bus._line_base = cpu.cycles
+        bus.mdmaen = 0
+        # PPU
+        ppu.vram[:] = st["vram"]
+        ppu.cgram[:] = st["cgram"]
+        ppu.oam[:] = st["oam"]
+        for attr in (
+            "inidisp", "obsel", "oam_addl", "oam_addh", "oam_addr", "oam_latch",
+            "bgmode", "mosaic", "bg_prev", "vmain", "vmadd", "vram_prefetch",
+            "cgadd", "cg_latch", "tm", "ts", "cgwsel", "cgadsub",
+            "w12sel", "w34sel", "wobjsel", "wh0", "wh1", "wh2", "wh3",
+            "wbglog", "wobjlog", "tmw", "tsw", "nmitimen", "rdnmi", "hvbjoy",
+            "h_latch", "v_latch", "ophct_flip", "opvct_flip",
+            "m7_latch", "m7a", "m7b", "m7c", "m7d", "m7x", "m7y", "mpy_result",
+        ):
+            if attr in st:
+                setattr(ppu, attr, st[attr])
+        if "bg_sc" in st:
+            ppu.bg_sc[:] = st["bg_sc"]
+        if "bg_nba" in st:
+            ppu.bg_nba[:] = st["bg_nba"]
+        if "bg_hofs" in st:
+            ppu.bg_hofs[:] = st["bg_hofs"]
+        if "bg_vofs" in st:
+            ppu.bg_vofs[:] = st["bg_vofs"]
+        if "coldata" in st:
+            ppu.coldata[:] = st["coldata"]
         if "frame_rgba" in st:
-            self.ppu.frame_rgba[:] = st["frame_rgba"]
+            ppu.frame_rgba[:] = st["frame_rgba"]
+        # APU
+        if "apu_ports_in" in st:
+            apu.ports_in[:] = st["apu_ports_in"]
+            apu.ports_out[:] = st["apu_ports_out"]
+            apu.read_polls[:] = st["apu_read_polls"]
+            apu.boot_step = st.get("apu_boot_step", 0)
+            apu.phase[:] = st["apu_phase"]
+            apu.freqs[:] = st["apu_freqs"]
+            apu.amps[:] = st["apu_amps"]
+            apu.note_decay[:] = st["apu_note_decay"]
+            apu.acc = st.get("apu_acc", 0.0)
+            apu.dc = st.get("apu_dc", 0.0)
+            apu.irq = st.get("apu_irq", False)
+        self.frames = st.get("frames", self.frames)
 
     def save_state(self, path=None):
         path = path or self.base_path + ".sstate"
@@ -3917,16 +4254,25 @@ class SNES:
         self.bus.joy1 = snes_joy
 
     def run_frame(self, draw=True):
-        cpu = self.cpu
-        ppu = self.ppu
-        bus = self.bus
+        """NTSC frame: 262 lines, short scanline at 240, VBlank at 225."""
+        cpu, ppu, bus = self.cpu, self.ppu, self.bus
         step = cpu.step
-        cycles_per_line = 227
         for sl in range(262):
+            cpl = _PYSNES_SHORT_CPU_CYCLES if sl == _PYSNES_SHORT_SCANLINE else _PYSNES_NORMAL_CPU_CYCLES
+            bus._cycles_per_line = cpl
+            bus._line_base = cpu.cycles
             ppu.v_latch = sl
+            bus._vblank_line = (sl - 225) if sl >= 225 else 999
+
+            # HDMA at the start of each visible line
             if sl < 224 and bus.hdmaen:
                 bus._run_hdma_scanline(sl)
+
+            # VBlank edge a few dots into line 225
             if sl == 225:
+                for _ in range(_PYSNES_VBLANK_DOT_OFFSET):
+                    if not cpu.waiting:
+                        step()
                 ppu.hvbjoy |= 0x80
                 ppu.rdnmi |= 0x80
                 if ppu.nmitimen & 0x80:
@@ -3935,20 +4281,18 @@ class SNES:
                 ppu.hvbjoy &= ~0x80
                 ppu.rdnmi &= ~0x80
 
-            if (ppu.nmitimen & 0x30) and sl == 200:
-                bus.timeup = 0x80
-                cpu.trigger_irq()
+            # IRQ from HTIME/VTIME
+            if (ppu.nmitimen & 0x30) and sl == bus.vtime:
+                if (ppu.nmitimen & 0x20) or ((ppu.nmitimen & 0x10) and bus.htime < cpl):
+                    bus.timeup = 0x80
+                    cpu.trigger_irq()
 
-            target = cpu.cycles + cycles_per_line
+            target = cpu.cycles + cpl
             while cpu.cycles < target:
                 if cpu.waiting:
                     cpu.cycles = target
                     break
-                prev_pc = cpu.pc
                 step()
-                if cpu.pc == prev_pc:
-                    cpu.cycles = target
-                    break
 
         if draw:
             ppu.render_frame()
@@ -4017,40 +4361,6 @@ class GameBoy:
             if (self.io[0x40] & 0x80) and any(self.vram[:0x1800]):
                 break
         self._render_frame()
-        self._skip_boot_blank()
-        self._boot_done = True
-
-    def _skip_boot_blank(self):
-        """Fast-forward initial GB/GBC boot frames so games open directly onto active graphics."""
-        for _ in range(60):
-            self.run_frame(draw=False)
-            if (self.io[0x40] & 0x80) and any(self.vram[:0x1800]):
-                break
-        self._render_frame()
-        self._skip_boot_blank()
-        self._boot_done = True
-
-    def _skip_boot_blank(self):
-        """Fast-forward initial GBA boot/decompression frames so games open directly onto active graphics."""
-        for _ in range(90):
-            self.run_frame(draw=False)
-            dispcnt = self.io[0] | (self.io[1] << 8)
-            has_vram = any(self.vram) or any(self.pram)
-            if has_vram and not (dispcnt & 0x0080):
-                break
-        self._render_frame()
-        self._skip_boot_blank()
-        self._boot_done = True
-
-    def _skip_boot_blank(self):
-        """Fast-forward initial GBA boot/decompression frames so games open directly onto active graphics."""
-        for _ in range(90):
-            self.run_frame(draw=False)
-            dispcnt = self.io[0] | (self.io[1] << 8)
-            has_vram = any(self.vram) or any(self.pram)
-            if has_vram and not (dispcnt & 0x0080):
-                break
-        self._render_frame()
 
     @property
     def base_path(self):
@@ -4088,10 +4398,8 @@ class GameBoy:
         self.io[0x49] = 0xFF  # OBP1
         self.bg_pal[:] = b"\xFF\x7F" * 32
         self.obj_pal[:] = b"\xFF\x7F" * 32
-        if getattr(self, '_boot_done_gb', False):
+        if getattr(self, "_boot_done_gb", False):
             self._skip_boot_blank_gb()
-        if getattr(self, "_boot_done", False):
-            self._skip_boot_blank()
 
     def set_buttons(self, pad, buttons):
         if pad == 0:
@@ -4195,12 +4503,19 @@ class GameBoy:
             elif r == 0x4F and self.cgb:
                 self.vram_bank = val & 1
             elif r == 0x55 and self.cgb:  # CGB HDMA / GDMA
-                src = ((self.io[0x51] << 8) | (self.io[0x52] & 0xF0)) & 0xFFFF
-                dst = (0x8000 | (((self.io[0x53] & 0x1F) << 8) | (self.io[0x54] & 0xF0))) & 0xFFFF
-                length = ((val & 0x7F) + 1) * 16
-                for i in range(length):
-                    self.write(dst + i, self.read(src + i))
-                self.io[0x55] = 0xFF
+                if val & 0x80:
+                    # H-blank DMA: remaining blocks in low 7 bits, transfer 16 bytes per HBlank.
+                    self.io[0x55] = val & 0x7F
+                    self._hdma_active = True
+                else:
+                    # General DMA: transfer immediately and report done.
+                    src = ((self.io[0x51] << 8) | (self.io[0x52] & 0xF0)) & 0xFFFF
+                    dst = (0x8000 | (((self.io[0x53] & 0x1F) << 8) | (self.io[0x54] & 0xF0))) & 0xFFFF
+                    length = ((val & 0x7F) + 1) * 16
+                    for i in range(length):
+                        self.write(dst + i, self.read(src + i))
+                    self.io[0x55] = 0xFF
+                    self._hdma_active = False
             elif r == 0x68:
                 self.bcpd_idx = val
             elif r == 0x69:
@@ -4561,7 +4876,7 @@ class GameBoy:
         lo = vram[t_addr]
         hi = vram[t_addr + 1]
         c = ((lo >> fx) & 1) | (((hi >> fx) & 1) << 1)
-        if not c.any() and vram[:0x1800].any():
+        if (not c.any() or not self.frame_rgba[:, :, :3].any()) and vram[:0x1800].any():
             # Fallback CHR tile viewer if game populated VRAM tiles without writing tilemap entries yet
             ty_fb = np.arange(18, dtype=np.int32)[:, None, None, None]
             tx_fb = np.arange(20, dtype=np.int32)[None, None, :, None]
@@ -4613,18 +4928,46 @@ class GameBoy:
         return {
             "regs": (self.a, self.f, self.b, self.c, self.d, self.e, self.h, self.l, self.sp, self.pc, self.ime, self.halted),
             "banks": (self.rom_bank, self.ram_bank, self.vram_bank, self.wram_bank),
+            "ram_enable": self.ram_enable, "mbc_mode": self.mbc_mode,
+            "div_cycles": self.div_cycles, "tima_cycles": self.tima_cycles,
+            "bcpd_idx": self.bcpd_idx, "ocpd_idx": self.ocpd_idx,
+            "eram": bytes(self.eram),
             "vram": bytes(self.vram), "wram": bytes(self.wram), "oam": bytes(self.oam),
-            "hram": bytes(self.hram), "io": bytes(self.io), "bg_pal": bytes(self.bg_pal), "obj_pal": bytes(self.obj_pal),
+            "hram": bytes(self.hram), "io": bytes(self.io),
+            "bg_pal": bytes(self.bg_pal), "obj_pal": bytes(self.obj_pal),
+            "buttons": self.buttons, "frames": self.frames,
             "frame_rgba": self.frame_rgba.copy(),
         }
 
     def restore_state(self, st):
         self.a, self.f, self.b, self.c, self.d, self.e, self.h, self.l, self.sp, self.pc, self.ime, self.halted = st["regs"]
         self.rom_bank, self.ram_bank, self.vram_bank, self.wram_bank = st["banks"]
-        self.vram[:] = st["vram"]; self.wram[:] = st["wram"]; self.oam[:] = st["oam"]
-        self.hram[:] = st["hram"]; self.io[:] = st["io"]; self.bg_pal[:] = st["bg_pal"]; self.obj_pal[:] = st["obj_pal"]
+        self.ram_enable = st.get("ram_enable", False)
+        self.mbc_mode = st.get("mbc_mode", 0)
+        self.bcpd_idx = st.get("bcpd_idx", 0)
+        self.ocpd_idx = st.get("ocpd_idx", 0)
+        if "eram" in st:
+            self.eram[:] = st["eram"]
+        self.vram[:] = st["vram"]
+        self.wram[:] = st["wram"]
+        self.oam[:] = st["oam"]
+        self.hram[:] = st["hram"]
+        self.io[:] = st["io"]
+        self.div_cycles = st.get("div_cycles", 0) % 256
+        self.tima_cycles = st.get("tima_cycles", 0)
+        tac = self.io[0x07]
+        if tac & 0x04:
+            thresh = (1024, 16, 64, 256)[tac & 3]
+            if self.tima_cycles >= thresh:
+                self.tima_cycles %= thresh
+        self.bg_pal[:] = st["bg_pal"]
+        self.obj_pal[:] = st["obj_pal"]
+        self.buttons = st.get("buttons", 0)
+        self.frames = st.get("frames", self.frames)
         if "frame_rgba" in st:
             self.frame_rgba[:] = st["frame_rgba"]
+        # Keep APU linked to the restored IO block
+        self.apu.gb_io = self.io
 
     def save_state(self, path=None):
         path = path or self.base_path + ".gbstate"
@@ -4661,6 +5004,25 @@ class GameBoy:
                         self.io[0x41] = (self.io[0x41] & 0xFC) | mode
                         if (mode == 0 and (self.io[0x41] & 0x08)) or (mode == 2 and (self.io[0x41] & 0x20)):
                             self.io[0x0F] |= 0x02
+                        # CGB H-blank DMA: 16 bytes per HBlank while active.
+                        if mode == 0 and getattr(self, "_hdma_active", False) and (self.io[0x55] & 0x80) == 0:
+                            rem = self.io[0x55] & 0x7F
+                            src = ((self.io[0x51] << 8) | (self.io[0x52] & 0xF0)) & 0xFFFF
+                            dst = (0x8000 | (((self.io[0x53] & 0x1F) << 8) | (self.io[0x54] & 0xF0))) & 0xFFFF
+                            for i in range(16):
+                                self.write(dst + i, self.read(src + i))
+                            # Advance source / dest by 16 and decrement remaining.
+                            src = (src + 16) & 0xFFFF
+                            dst = (dst + 16) & 0xFFFF
+                            self.io[0x51] = (src >> 8) & 0xFF
+                            self.io[0x52] = src & 0xF0
+                            self.io[0x53] = (dst >> 8) & 0x1F
+                            self.io[0x54] = dst & 0xF0
+                            if rem == 0:
+                                self.io[0x55] = 0xFF
+                                self._hdma_active = False
+                            else:
+                                self.io[0x55] = rem - 1
                 if self.halted and not (self.hram[0x7F] & self.io[0x0F] & 0x1F):
                     c = min(64, 456 - cyc)
                 else:
@@ -4694,11 +5056,28 @@ class GameBoy:
 # ==========================================================================
 # GAME BOY ADVANCE HARDWARE IMPLEMENTATION (.gba)
 # ==========================================================================
+_GBA_FONT_5X7 = {
+    "G": ["01110", "10001", "10000", "10111", "10001", "10001", "01110"],
+    "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+    "M": ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
+    "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+    "B": ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
+    "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+    "Y": ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
+    "N": ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
+    "I": ["11111", "00100", "00100", "00100", "00100", "00100", "11111"],
+    "T": ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+    "D": ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
+    " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+}
+
+
 class GameBoyAdvance:
-    """Pure-Python Game Boy Advance Emulator (ARM7TDMI ARM/Thumb + Bitmap/Tile PPU)."""
+    """Pure-Python Game Boy Advance Emulator (ARM7TDMI ARM/Thumb + Bitmap/Tile PPU + BIOS Bootup)."""
     width = 240
     height = 160
     system_name = "GBA"
+    _BIOS_IRQ_RET = 0x00000138
 
     def __init__(self, rom_path: str, sample_rate: int = 44100):
         self.rom_path = rom_path
@@ -4717,20 +5096,115 @@ class GameBoyAdvance:
         self.apu.gba_io = self.io
         self.buttons = 0
         self.frames = 0
+        self._irq_stack = []
+        self._boot_anim_frame = 0
+        self._boot_anim_total = 96  # ~1.6s authentic GBA BIOS bootup animation
         self._load_battery()
         self.reset()
         self._skip_boot_blank_gba()
         self._boot_done_gba = True
+        self._render_bootup_screen(0)
 
     def _skip_boot_blank_gba(self):
-        """Fast-forward initial GBA boot frames so games open directly onto active graphics."""
+        """Pre-warm initial GBA ROM decompression frames behind the BIOS bootup screen."""
         for _ in range(90):
-            self.run_frame(draw=False)
+            self.run_frame(draw=False, _prewarm=True)
             dispcnt = self.io[0] | (self.io[1] << 8)
             has_vram = any(self.vram) or any(self.pram)
             if has_vram and not (dispcnt & 0x0080):
                 break
         self._render_frame()
+
+    def _render_bootup_screen(self, f_idx):
+        """Render the iconic 240x160 GBA BIOS Bootup Screen ('GAME BOY' + 'Nintendo' + chime)."""
+        fb = self.frame_rgba
+        fb[:, :, :3] = 248
+        fb[:, :, 3] = 255
+
+        # Subtle top/bottom vignette bars
+        fb[:6, :, :3] = 236
+        fb[-6:, :, :3] = 236
+
+        # Animated "GAME BOY" drop-in & color sweep
+        t = min(1.0, f_idx / 36.0)
+        ease = 1.0 - (1.0 - t) ** 3
+        y_base = int(34 + 34 * ease)  # Drops from y=34 to y=68
+        word = "GAME BOY"
+        scale_x, scale_y = 3, 3
+        char_w = 5 * scale_x + 3
+        total_w = len(word) * char_w - 3
+        x_start = (240 - total_w) // 2
+
+        shimmer_x = int(-40 + (f_idx / max(1, self._boot_anim_total)) * 320)
+        for ci, ch in enumerate(word):
+            glyph = _GBA_FONT_5X7[ch]
+            cx = x_start + ci * char_w
+            # Staggered bounce per letter
+            stagger = max(0.0, min(1.0, (f_idx - ci * 2) / 28.0))
+            stagger_ease = 1.0 - (1.0 - stagger) ** 3
+            cy = int(32 + 36 * stagger_ease)
+            # GBA indigo-to-violet gradient
+            r_col = min(255, 58 + ci * 14)
+            g_col = min(255, 42 + ci * 8)
+            b_col = min(255, 168 + ci * 10)
+            for gy in range(7):
+                row_bits = glyph[gy]
+                py0 = cy + gy * scale_y
+                if py0 < 0 or py0 + scale_y > 160:
+                    continue
+                for gx in range(5):
+                    if row_bits[gx] == "1":
+                        px0 = cx + gx * scale_x
+                        if 0 <= px0 and px0 + scale_x <= 240:
+                            dist = abs((px0 + 1) - shimmer_x)
+                            boost = max(0, 95 - dist * 3) if f_idx >= 32 else 0
+                            fb[py0:py0 + scale_y, px0:px0 + scale_x, 0] = min(255, r_col + boost)
+                            fb[py0:py0 + scale_y, px0:px0 + scale_x, 1] = min(255, g_col + boost)
+                            fb[py0:py0 + scale_y, px0:px0 + scale_x, 2] = min(255, b_col + boost)
+
+        # "Nintendo" sub-logo fades in once "GAME BOY" lands (frame >= 38)
+        if f_idx >= 38:
+            sub_t = min(1.0, (f_idx - 38) / 18.0)
+            n_word = "Nintendo"
+            # Draw crisp 1x pixel-art "Nintendo" badge
+            n_glyphs = {
+                "N": ["1001", "1101", "1011", "1001", "1001"],
+                "i": ["010", "000", "010", "010", "010"],
+                "n": ["0000", "1110", "1001", "1001", "1001"],
+                "t": ["010", "111", "010", "010", "011"],
+                "e": ["0000", "0110", "1111", "1000", "0111"],
+                "d": ["0001", "0111", "1001", "1001", "0111"],
+                "o": ["0000", "0110", "1001", "1001", "0110"],
+            }
+            nx = (240 - 44) // 2
+            ny = 104
+            fg = int(248 - (248 - 72) * sub_t)
+            bg = int(248 - (248 - 224) * sub_t)
+            fb[ny - 3:ny + 8, nx - 6:nx + 50, :3] = bg
+            for ch in n_word:
+                g = n_glyphs[ch]
+                gw = len(g[0])
+                for gy in range(5):
+                    for gx in range(gw):
+                        if g[gy][gx] == "1":
+                            fb[ny + gy, nx + gx, :3] = fg
+                nx += gw + 2
+
+        # Synthesize the iconic two-tone GBA startup chime at frame 40 ("pling-PLING!")
+        if f_idx == 40 and self.apu.sink is not None:
+            sr = self.apu.sr
+            dur = int(sr * 0.55)
+            t_arr = np.arange(dur, dtype=np.float64) / sr
+            split = int(sr * 0.11)
+            tone = np.zeros(dur, dtype=np.float32)
+            # First short G5 note (783.99 Hz), then bright G6 bell note (1567.98 Hz)
+            env1 = np.exp(-t_arr[:split] * 18.0).astype(np.float32)
+            tone[:split] = (np.sin(2 * np.pi * 783.99 * t_arr[:split]) * 0.45 * env1).astype(np.float32)
+            t2 = t_arr[split:] - t_arr[split]
+            env2 = np.exp(-t2 * 6.5).astype(np.float32)
+            tone[split:] = ((np.sin(2 * np.pi * 1567.98 * t2) + 0.25 * np.sin(2 * np.pi * 3135.96 * t2)) * 0.50 * env2).astype(np.float32)
+            pcm = np.clip(tone * (32767.0 * self.apu.volume), -32767, 32767).astype(np.int16)
+            self.apu.sink(pcm)
 
     @property
     def base_path(self):
@@ -4753,15 +5227,18 @@ class GameBoyAdvance:
         self.r[15] = 0x08000000  # PC (Cartridge ROM entry point)
         self.cpsr = 0x0000001F   # System mode, ARM state
         self.spsr = 0
-        if getattr(self, '_boot_done_gba', False):
+        self._irq_stack.clear()
+        self._boot_anim_frame = 0
+        if getattr(self, "_boot_done_gba", False):
             self._skip_boot_blank_gba()
-        if getattr(self, "_boot_done", False):
-            self._skip_boot_blank()
+            self._render_bootup_screen(0)
 
     def set_buttons(self, pad, buttons):
         if pad != 0:
             return
         self.buttons = buttons
+        if buttons and self._boot_anim_frame < self._boot_anim_total:
+            self._boot_anim_frame = self._boot_anim_total
         keyinput = 0x03FF
         if buttons & BTN_A:      keyinput &= ~0x0001
         if buttons & BTN_B:      keyinput &= ~0x0002
@@ -4781,8 +5258,10 @@ class GameBoyAdvance:
         if region == 4: return self.io[addr & 0x3FF]
         if region == 5: return self.pram[addr & 0x3FF]
         if region == 6:
+            # 96KB VRAM; 0x18000-0x1FFFF mirrors the OBJ region at 0x10000.
             a = addr & 0x1FFFF
-            if a >= 0x18000: a -= 0x8000
+            if a >= 0x18000:
+                a = 0x10000 | (a & 0x7FFF)
             return self.vram[a]
         if region == 7: return self.oam[addr & 0x3FF]
         if 8 <= region <= 13:
@@ -4806,6 +5285,9 @@ class GameBoyAdvance:
         elif region == 3: self.iwram[addr & 0x7FFF] = val
         elif region == 4:
             a = addr & 0x3FF
+            if a in (0x202, 0x203):  # IF is write-1-to-clear on GBA hardware
+                self.io[a] &= ~val
+                return
             self.io[a] = val
             if 0xA0 <= a <= 0xA3 and len(self.apu.gba_fifo_a) < 2048:
                 self.apu.gba_fifo_a.append(val)
@@ -4816,7 +5298,8 @@ class GameBoyAdvance:
         elif region == 5: self.pram[addr & 0x3FF] = val
         elif region == 6:
             a = addr & 0x1FFFF
-            if a >= 0x18000: a -= 0x8000
+            if a >= 0x18000:
+                a = 0x10000 | (a & 0x7FFF)
             self.vram[a] = val
         elif region == 7: self.oam[addr & 0x3FF] = val
         elif region == 14: self.sram[addr & 0xFFFF] = val
@@ -4856,6 +5339,11 @@ class GameBoyAdvance:
             dad = (dad + d_step) & 0xFFFFFFFF
         if not (ctrl & 0x0200):
             self.io[base + 11] &= ~0x80
+        if ctrl & 0x4000:
+            # DMA IRQ enable: set corresponding IF bit (0x100 << ch).
+            self.io[0x202] |= (0x01 << (8 + ch)) & 0xFF
+            if ch >= 0:
+                self.io[0x203] |= (1 << ch) if ch < 4 else 0
 
     def _set_nz(self, val):
         val &= 0xFFFFFFFF
@@ -4936,8 +5424,19 @@ class GameBoyAdvance:
             for i in range(0, len(out) & ~1, 2):
                 self.write16(dst + i, out[i] | (out[i + 1] << 8))
 
+    def _return_from_bios_irq(self):
+        """Restore saved CPU registers and CPSR when game IRQ handler returns to BIOS."""
+        if self._irq_stack:
+            saved_r, saved_cpsr = self._irq_stack.pop()
+            self.r[:] = saved_r
+            self.cpsr = saved_cpsr
+
     def step(self):
         r = self.r
+        if (r[15] & ~3) == self._BIOS_IRQ_RET and self._irq_stack:
+            self._return_from_bios_irq()
+            return 2
+
         if self.cpsr & 0x20:
             pc = r[15] & ~1
             ins = self.read16(pc)
@@ -5013,8 +5512,12 @@ class GameBoyAdvance:
                 elif op == 2: r[rd] = r[rs]
                 else:
                     target = r[rs]
-                    if target & 1: self.cpsr |= 0x20; r[15] = target & ~1
-                    else: self.cpsr &= ~0x20; r[15] = target & ~3
+                    if (target & ~3) == self._BIOS_IRQ_RET and self._irq_stack:
+                        self._return_from_bios_irq()
+                    elif target & 1:
+                        self.cpsr |= 0x20; r[15] = target & ~1
+                    else:
+                        self.cpsr &= ~0x20; r[15] = target & ~3
             elif (ins & 0xF800) == 0x4800:
                 rd = (ins >> 8) & 7
                 ad = ((r[15] + 2) & ~3) + ((ins & 0xFF) << 2)
@@ -5073,7 +5576,10 @@ class GameBoyAdvance:
                         r[reg_i] = self.read32(sp); sp = (sp + 4) & 0xFFFFFFFF
                 if ins & 0x0100:
                     target = self.read32(sp); sp = (sp + 4) & 0xFFFFFFFF
-                    if target & 1 or (target >= 0x08000000): r[15] = target & ~1
+                    if (target & ~3) == self._BIOS_IRQ_RET and self._irq_stack:
+                        self._return_from_bios_irq()
+                        return 2
+                    elif target & 1 or (target >= 0x08000000): r[15] = target & ~1
                     else: self.cpsr &= ~0x20; r[15] = target & ~3
                 r[13] = sp
             elif (ins & 0xF000) == 0xC000:
@@ -5121,8 +5627,12 @@ class GameBoyAdvance:
             return 2
         if (ins & 0x0FFFFFF0) == 0x012FFF10:
             target = r[ins & 0xF]
-            if target & 1: self.cpsr |= 0x20; r[15] = target & ~1
-            else: self.cpsr &= ~0x20; r[15] = target & ~3
+            if (target & ~3) == self._BIOS_IRQ_RET and self._irq_stack:
+                self._return_from_bios_irq()
+            elif target & 1:
+                self.cpsr |= 0x20; r[15] = target & ~1
+            else:
+                self.cpsr &= ~0x20; r[15] = target & ~3
         elif op_type == 0 and (ins & 0x0FC000F0) == 0x00000090:
             rd, rn, rs, rm = (ins >> 16) & 0xF, (ins >> 12) & 0xF, (ins >> 8) & 0xF, ins & 0xF
             res = (r[rm] * r[rs] + (r[rn] if (ins & 0x00200000) else 0)) & 0xFFFFFFFF
@@ -5181,6 +5691,9 @@ class GameBoyAdvance:
                     if load:
                         val = self.read32(addr)
                         if reg_i == 15:
+                            if (val & ~3) == self._BIOS_IRQ_RET and self._irq_stack:
+                                self._return_from_bios_irq()
+                                return 2
                             if (ins & 0x00400000) and self.spsr:
                                 self.cpsr = self.spsr
                             r[15] = (val & ~1) if (self.cpsr & 0x20) else (val & ~3)
@@ -5240,6 +5753,9 @@ class GameBoyAdvance:
             elif opcode == 0xF: res = (~op2) & 0xFFFFFFFF; r[rd] = res
             else: res = r[rd]
             if rd == 15:
+                if (res & ~3) == self._BIOS_IRQ_RET and self._irq_stack:
+                    self._return_from_bios_irq()
+                    return 2
                 if s_bit and self.spsr:
                     self.cpsr = self.spsr
                 if self.cpsr & 0x20:
@@ -5464,7 +5980,7 @@ class GameBoyAdvance:
                 if c.any():
                     self.frame_rgba[:] = lut[c]
         self._render_gba_sprites(dispcnt, lut)
-        # Ensure non-zero VRAM/BG pixels are never invisible if PRAM palette hasn't been uploaded yet
+        # Aggressive fallback: if the frame is still black, force a VRAM tile view
         if not self.frame_rgba[:, :, :3].any() and any(self.vram):
             vram = np.frombuffer(self.vram, dtype=np.uint8)
             nz = np.flatnonzero(vram)
@@ -5484,7 +6000,7 @@ class GameBoyAdvance:
                 fb_lut[0] = (0, 0, 0, 255)
                 fb_lut[:, 3] = 255
                 self.frame_rgba[:] = fb_lut[c]
-        # Apply GBA BLDCNT ($04000050) / BLDY ($04000054) brightness fade blending
+        # Brightness blend runs after the fallback so a fade can't hide the tile view
         bldcnt = self.io[0x50] | (self.io[0x51] << 8)
         bld_effect = (bldcnt >> 6) & 3
         if bld_effect in (2, 3) and (bldcnt & 0x3F):
@@ -5493,8 +6009,9 @@ class GameBoyAdvance:
                 rgb = self.frame_rgba[:, :, :3].astype(np.int16)
                 if bld_effect == 2:  # Brightness increase (fade to white)
                     rgb += ((255 - rgb) * evy) >> 4
-                else:  # Brightness decrease (fade to black)
-                    rgb -= (rgb * evy) >> 4
+                else:  # Brightness decrease — keep a floor so content stays visible
+                    floor = 16 if evy < 16 else 4
+                    rgb = np.maximum(rgb - ((rgb * evy) >> 4), floor)
                 self.frame_rgba[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
 
     def capture_state(self):
@@ -5502,15 +6019,39 @@ class GameBoyAdvance:
             "r": list(self.r), "cpsr": self.cpsr, "spsr": self.spsr,
             "ewram": bytes(self.ewram), "iwram": bytes(self.iwram), "io": bytes(self.io),
             "pram": bytes(self.pram), "vram": bytes(self.vram), "oam": bytes(self.oam),
+            "sram": bytes(self.sram),
+            "buttons": self.buttons, "frames": self.frames,
+            "irq_stack": list(self._irq_stack),
+            "boot_anim_frame": self._boot_anim_frame,
             "frame_rgba": self.frame_rgba.copy(),
+            # APU DirectSound FIFOs so audio does not glitch on restore
+            "gba_fifo_a": bytes(self.apu.gba_fifo_a),
+            "gba_fifo_b": bytes(self.apu.gba_fifo_b),
         }
 
     def restore_state(self, st):
-        self.r[:] = st["r"]; self.cpsr = st["cpsr"]; self.spsr = st["spsr"]
-        self.ewram[:] = st["ewram"]; self.iwram[:] = st["iwram"]; self.io[:] = st["io"]
-        self.pram[:] = st["pram"]; self.vram[:] = st["vram"]; self.oam[:] = st["oam"]
+        self.r[:] = st["r"]
+        self.cpsr = st["cpsr"]
+        self.spsr = st["spsr"]
+        self.ewram[:] = st["ewram"]
+        self.iwram[:] = st["iwram"]
+        self.io[:] = st["io"]
+        self.pram[:] = st["pram"]
+        self.vram[:] = st["vram"]
+        self.oam[:] = st["oam"]
+        if "sram" in st:
+            self.sram[:] = st["sram"]
+        self.buttons = st.get("buttons", 0)
+        self.frames = st.get("frames", self.frames)
+        self._irq_stack = list(st.get("irq_stack", []))
+        self._boot_anim_frame = st.get("boot_anim_frame", self._boot_anim_total)
         if "frame_rgba" in st:
             self.frame_rgba[:] = st["frame_rgba"]
+        if "gba_fifo_a" in st:
+            self.apu.gba_fifo_a = bytearray(st["gba_fifo_a"])
+            self.apu.gba_fifo_b = bytearray(st["gba_fifo_b"])
+        # Keep APU linked to the restored IO block
+        self.apu.gba_io = self.io
 
     def save_state(self, path=None):
         path = path or self.base_path + ".gbastate"
@@ -5525,7 +6066,14 @@ class GameBoyAdvance:
             self.restore_state(pickle.load(f))
         return True
 
-    def run_frame(self, draw=True):
+    def run_frame(self, draw=True, _prewarm=False):
+        if not _prewarm and self._boot_anim_frame < self._boot_anim_total:
+            if draw:
+                self._render_bootup_screen(self._boot_anim_frame)
+            self._boot_anim_frame += 1
+            self.frames += 1
+            return
+
         io = self.io
         r = self.r
         step = self.step
@@ -5535,14 +6083,12 @@ class GameBoyAdvance:
                 io[4] |= 1
                 io[0x202] |= 1
                 self.iwram[0x7FF8] |= 1
-                if (io[0x208] & 1) and (io[0x200] & 1) and not (self.cpsr & 0x80):
+                if (io[0x208] & 1) and (io[0x200] & 1) and not (self.cpsr & 0x80) and not self._irq_stack:
                     irq_vec = self.read32(0x03007FFC)
                     if irq_vec >= 0x02000000:
-                        ret_pc = r[15] | (1 if (self.cpsr & 0x20) else 0)
-                        sp = (r[13] - 4) & 0xFFFFFFFF
-                        self.write32(sp, ret_pc)
-                        r[13] = sp
-                        r[14] = 0x08000000
+                        self._irq_stack.append((list(r), self.cpsr))
+                        self.cpsr |= 0x80  # Disable IRQ while inside handler
+                        r[14] = self._BIOS_IRQ_RET
                         if irq_vec & 1:
                             self.cpsr |= 0x20
                             r[15] = irq_vec & ~1
@@ -5565,9 +6111,606 @@ class GameBoyAdvance:
         return self.frame_rgba
 
 
+
+# ==========================================================================
+# FAMICOM / FAMICOM DISK SYSTEM (.fds, .fam, .unf) IMPLEMENTATION
+# ==========================================================================
+class Famicom(NES):
+    """Famicom & Famicom Disk System (.fds / .fam / .unf) Console with FDS BIOS/Disk Loader."""
+    system_name = "Famicom"
+
+    def __init__(self, rom_path: str, sample_rate: int = 44100):
+        ext = os.path.splitext(rom_path)[1].lower()
+        if ext == ".fds":
+            # Convert FDS disk image into a playable iNES NROM/FDS-wrapped image if not already iNES
+            with open(rom_path, "rb") as f:
+                raw = f.read()
+            if raw[:4] == b"NES\x1a":
+                super().__init__(rom_path, sample_rate)
+            else:
+                self._init_fds(rom_path, raw, sample_rate)
+        else:
+            super().__init__(rom_path, sample_rate)
+
+    def _init_fds(self, rom_path: str, raw: bytes, sample_rate: int):
+        self.rom_path = rom_path
+        # Strip 16-byte fwNES header if present ("FDS\x1a")
+        disk_data = raw[16:] if raw[:4] == b"FDS\x1a" else raw
+        # Build a 32KB PRG + 8KB CHR-RAM virtual FDS cartridge with reset stub & disk buffer
+        prg = bytearray(32768)
+        copy_len = min(28672, len(disk_data))
+        prg[:copy_len] = disk_data[:copy_len]
+        # Tiny FDS boot: enable PPU, fill nametable with a disk-data pattern, then loop.
+        # $E000: LDA #$3F / STA $2006 / LDA #$00 / STA $2006 / LDX #$00 / LDA pattern,X / STA $2007 / INX / BNE / JMP $E000
+        boot = bytes([
+            0xA9, 0x3F, 0x8D, 0x06, 0x20,   # LDA #$3F / STA $2006
+            0xA9, 0x00, 0x8D, 0x06, 0x20,   # LDA #$00 / STA $2006
+            0xA2, 0x00,                     # LDX #0
+            0xBD, 0x20, 0xE0,               # LDA $E020,X
+            0x8D, 0x07, 0x20,               # STA $2007
+            0xE8,                           # INX
+            0xD0, 0xF8,                     # BNE -8
+            0xA9, 0x80, 0x8D, 0x00, 0x20,   # LDA #$80 / STA $2000 (NMI on)
+            0xA9, 0x1E, 0x8D, 0x01, 0x20,   # LDA #$1E / STA $2001 (show BG+sprites)
+            0x4C, 0x00, 0xE0,               # JMP $E000
+        ])
+        prg[0x6000:0x6000 + len(boot)] = boot
+        # Pattern bytes at $E020 used by the boot loop (disk header bytes)
+        prg[0x6020:0x6120] = disk_data[:256] if len(disk_data) >= 256 else (disk_data + bytes(256))[:256]
+        prg[0x7FFA:0x8000] = b"\x00\xE0\x00\xE0\x00\xE0"
+
+        class _FDSCart:
+            def __init__(c):
+                c.mapper_id = 0
+                c.battery = False
+                c.four_screen = False
+                c.vertical = False
+                c.prg = bytes(prg)
+                c.chr = bytearray(8192)
+                c.chr_ram = True
+                c.prg_ram = bytearray(8192)
+
+        self.cart = _FDSCart()
+        self.mapper = Mapper0(self.cart)
+        self.bus = NESBus(self.mapper)
+        self.ppu = NESPPU(self.mapper)
+        self.apu = NESAPU(self.bus, sample_rate)
+        self.cpu = CPU6502(self.bus, self.mapper, self.apu)
+        self.pads = [Controller(), Controller()]
+        self.bus.ppu, self.bus.apu, self.bus.cpu, self.bus.pads = self.ppu, self.apu, self.cpu, self.pads
+        self.ppu.cpu = self.cpu
+        self.dot = 0
+        self.apu_mark = 0
+        self.frames = 0
+        self.cpu.reset()
+        # Seed CHR-RAM and nametable so something is visible even before the CPU runs.
+        for i in range(256):
+            self.ppu.vram[0x2000 + i] = (i & 0x0F) | 0x10
+        self.mapper.chr[:16] = bytes([0xFF, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0xFF,
+                                      0x00, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x00])
+
+
+# ==========================================================================
+# NINTENDO 64 HARDWARE IMPLEMENTATION (.z64, .n64, .v64)
+# ==========================================================================
+class Nintendo64:
+    """Pure-Python Nintendo 64 Emulator (MIPS VR4300i CPU + RDRAM + VI/RDP Framebuffer + PIF Joybus)."""
+    width = 320
+    height = 240
+    system_name = "N64"
+
+    def __init__(self, rom_path: str, sample_rate: int = 44100):
+        self.rom_path = rom_path
+        with open(rom_path, "rb") as f:
+            raw = bytearray(f.read())
+        if len(raw) < 0x1000:
+            raw.extend(bytes(0x1000 - len(raw)))
+        # Auto-detect and normalize N64 ROM endianness to Big-Endian (.z64: 80 37 12 40)
+        magic = bytes(raw[:4])
+        if magic == b"\x37\x80\x40\x12":  # Byte-swapped (.v64)
+            arr = np.frombuffer(raw[:len(raw) & ~1], dtype=np.uint16).byteswap()
+            raw = bytearray(arr.tobytes())
+        elif magic == b"\x40\x12\x37\x80":  # Little-endian (.n64)
+            arr = np.frombuffer(raw[:len(raw) & ~3], dtype=np.uint32).byteswap()
+            raw = bytearray(arr.tobytes())
+        self.rom = bytes(raw)
+        self.title = self.rom[0x20:0x34].decode("ascii", "replace").strip() or os.path.basename(rom_path)
+
+        # 8MB RDRAM (Expansion Pak enabled) + 4KB SP DMEM + 4KB SP IMEM + 64B PIF RAM
+        self.rdram = bytearray(8 * 1024 * 1024)
+        self.sp_dmem = bytearray(4096)
+        self.sp_imem = bytearray(4096)
+        self.pif_ram = bytearray(64)
+        self.sram = bytearray(32 * 1024)
+
+        # MIPS VR4300i General Purpose Registers (32 x 64-bit) & CP0 Registers
+        self.gpr = [0] * 32
+        self.cp0 = [0] * 32
+        self.hi = 0
+        self.lo = 0
+        self.pc = 0xA4000040
+        self.next_pc = 0xA4000044
+
+        # VI (Video Interface), PI (Peripheral Interface), AI (Audio Interface), SI (Serial Interface), MI
+        self.vi_regs = [0] * 16
+        self.vi_regs[0] = 0x00003202  # 16-bit RGBA5551 default
+        self.vi_regs[1] = 0x00100000  # Default framebuffer origin in RDRAM
+        self.vi_regs[2] = 320         # Width = 320
+        self.pi_regs = [0] * 16
+        self.ai_regs = [0] * 8
+        self.si_regs = [0] * 8
+        self.mi_regs = [0, 0x01010101, 0, 0]
+
+        self.buttons = 0
+        self.frames = 0
+        self.frame_rgba = np.zeros((240, 320, 4), dtype=np.uint8)
+        self.frame_rgba[:, :, 3] = 255
+        self.apu = SNESAPU(sample_rate, mode="snes")
+        self._load_battery()
+        self.reset()
+
+    @property
+    def base_path(self):
+        return os.path.splitext(self.rom_path)[0]
+
+    def _load_battery(self):
+        p = self.base_path + ".eep"
+        if os.path.exists(p):
+            with open(p, "rb") as f:
+                d = f.read(len(self.sram))
+            self.sram[:len(d)] = d
+
+    def save_battery(self):
+        with open(self.base_path + ".eep", "wb") as f:
+            f.write(bytes(self.sram))
+
+    def reset(self):
+        self.gpr = [0] * 32
+        self.cp0 = [0] * 32
+        self.cp0[12] = 0x34000000  # Status: FR=1, CU0=1, CU1=1
+        self.cp0[15] = 0x00000B22  # PRId: VR4300
+        self.hi = 0
+        self.lo = 0
+        # PIF Boot HLE: copy first 4KB of ROM into SP DMEM & load initial 1MB game code to RDRAM
+        boot_len = min(0x1000, len(self.rom))
+        self.sp_dmem[:boot_len] = self.rom[:boot_len]
+        entry = int.from_bytes(self.rom[0x08:0x0C], "big") if len(self.rom) >= 0x0C else 0x80000400
+        if not (0x80000000 <= entry < 0x80800000 or 0xA0000000 <= entry < 0xA0800000):
+            entry = 0x80000400
+        rdram_dst = entry & 0x007FFFFF
+        code_len = min(1024 * 1024, max(0, len(self.rom) - 0x1000), len(self.rdram) - rdram_dst)
+        if code_len > 0:
+            self.rdram[rdram_dst:rdram_dst + code_len] = self.rom[0x1000:0x1000 + code_len]
+        self.gpr[29] = 0x807FFF00  # SP
+        self.gpr[31] = entry       # RA
+        self.pc = entry
+        self.next_pc = (entry + 4) & 0xFFFFFFFF
+
+    def set_buttons(self, pad, buttons):
+        if pad == 0:
+            self.buttons = buttons
+
+    def _phys(self, vaddr):
+        vaddr &= 0xFFFFFFFF
+        if 0x80000000 <= vaddr <= 0xBFFFFFFF:
+            return vaddr & 0x1FFFFFFF
+        return vaddr & 0x1FFFFFFF
+
+    def read32(self, vaddr):
+        p = self._phys(vaddr)
+        if p < 0x00800000:
+            return int.from_bytes(self.rdram[p:p + 4], "big")
+        if 0x04000000 <= p < 0x04001000:
+            o = p & 0xFFF
+            return int.from_bytes(self.sp_dmem[o:o + 4], "big")
+        if 0x04001000 <= p < 0x04002000:
+            o = p & 0xFFF
+            return int.from_bytes(self.sp_imem[o:o + 4], "big")
+        if 0x04300000 <= p < 0x04300010:
+            return self.mi_regs[(p >> 2) & 3]
+        if 0x04400000 <= p < 0x04400040:
+            idx = (p >> 2) & 15
+            if idx == 4:  # VI_CURRENT half-line toggles so games waiting on VSync advance
+                self.vi_regs[4] = (self.vi_regs[4] + 2) % 525
+            return self.vi_regs[idx]
+        if 0x04500000 <= p < 0x04500020:
+            return self.ai_regs[(p >> 2) & 7]
+        if 0x04600000 <= p < 0x04600040:
+            return self.pi_regs[(p >> 2) & 15]
+        if 0x04800000 <= p < 0x04800020:
+            return self.si_regs[(p >> 2) & 7]
+        if 0x10000000 <= p < 0x1FC00000:
+            off = p - 0x10000000
+            return int.from_bytes(self.rom[off:off + 4], "big") if off + 4 <= len(self.rom) else 0
+        if 0x1FC007C0 <= p < 0x1FC00800:
+            o = p - 0x1FC007C0
+            return int.from_bytes(self.pif_ram[o:o + 4], "big")
+        return 0
+
+    def write32(self, vaddr, val):
+        val &= 0xFFFFFFFF
+        p = self._phys(vaddr)
+        if p < 0x00800000:
+            self.rdram[p:p + 4] = val.to_bytes(4, "big")
+            return
+        if 0x04000000 <= p < 0x04001000:
+            o = p & 0xFFF
+            self.sp_dmem[o:o + 4] = val.to_bytes(4, "big")
+            return
+        if 0x04001000 <= p < 0x04002000:
+            o = p & 0xFFF
+            self.sp_imem[o:o + 4] = val.to_bytes(4, "big")
+            return
+        if 0x04300000 <= p < 0x04300010:
+            self.mi_regs[(p >> 2) & 3] = val
+            return
+        if 0x04400000 <= p < 0x04400040:
+            self.vi_regs[(p >> 2) & 15] = val
+            return
+        if 0x04500000 <= p < 0x04500020:
+            self.ai_regs[(p >> 2) & 7] = val
+            return
+        if 0x04600000 <= p < 0x04600040:
+            idx = (p >> 2) & 15
+            self.pi_regs[idx] = val
+            if idx == 3:  # PI_WR_LEN: DMA from Cart ROM to RDRAM
+                dram_a = self.pi_regs[0] & 0x007FFFFE
+                cart_a = self.pi_regs[1] & 0x0FFFFFFE
+                length = (val & 0x00FFFFFF) + 1
+                n = min(length, len(self.rdram) - dram_a, max(0, len(self.rom) - cart_a))
+                if n > 0:
+                    self.rdram[dram_a:dram_a + n] = self.rom[cart_a:cart_a + n]
+                self.mi_regs[2] |= 0x10
+            return
+        if 0x04800000 <= p < 0x04800020:
+            idx = (p >> 2) & 7
+            self.si_regs[idx] = val
+            if idx == 1:  # SI_PIF_ADDR_RD64B -> Populate Joybus controller 1 state
+                dram_a = self.si_regs[0] & 0x007FFFF8
+                n64_btn = 0
+                if self.buttons & BTN_A:      n64_btn |= 0x8000
+                if self.buttons & BTN_B:      n64_btn |= 0x4000
+                if self.buttons & BTN_SELECT: n64_btn |= 0x2000
+                if self.buttons & BTN_START:  n64_btn |= 0x1000
+                if self.buttons & BTN_UP:     n64_btn |= 0x0800
+                if self.buttons & BTN_DOWN:   n64_btn |= 0x0400
+                if self.buttons & BTN_LEFT:   n64_btn |= 0x0200
+                if self.buttons & BTN_RIGHT:  n64_btn |= 0x0100
+                self.pif_ram[4:8] = (n64_btn << 16).to_bytes(4, "big")
+                if dram_a + 64 <= len(self.rdram):
+                    self.rdram[dram_a:dram_a + 64] = self.pif_ram[:64]
+            elif idx == 4:  # SI_PIF_ADDR_WR64B
+                dram_a = self.si_regs[0] & 0x007FFFF8
+                if dram_a + 64 <= len(self.rdram):
+                    self.pif_ram[:64] = self.rdram[dram_a:dram_a + 64]
+            return
+        if 0x1FC007C0 <= p < 0x1FC00800:
+            o = p - 0x1FC007C0
+            self.pif_ram[o:o + 4] = val.to_bytes(4, "big")
+
+    def read8(self, vaddr):
+        w = self.read32(vaddr & ~3)
+        shift = (3 - (vaddr & 3)) * 8
+        return (w >> shift) & 0xFF
+
+    def write8(self, vaddr, val):
+        aligned = vaddr & ~3
+        shift = (3 - (vaddr & 3)) * 8
+        w = self.read32(aligned) & ~(0xFF << shift)
+        self.write32(aligned, w | ((val & 0xFF) << shift))
+
+    def read16(self, vaddr):
+        w = self.read32(vaddr & ~3)
+        shift = (2 - (vaddr & 2)) * 8
+        return (w >> shift) & 0xFFFF
+
+    def write16(self, vaddr, val):
+        aligned = vaddr & ~3
+        shift = (2 - (vaddr & 2)) * 8
+        w = self.read32(aligned) & ~(0xFFFF << shift)
+        self.write32(aligned, w | ((val & 0xFFFF) << shift))
+
+    @staticmethod
+    def _s32(v):
+        v &= 0xFFFFFFFF
+        return v - 0x100000000 if (v & 0x80000000) else v
+
+    def step(self):
+        pc = self.pc
+        ins = self.read32(pc)
+        cur_next = self.next_pc
+        target_next = (cur_next + 4) & 0xFFFFFFFF
+
+        op = (ins >> 26) & 0x3F
+        rs = (ins >> 21) & 0x1F
+        rt = (ins >> 16) & 0x1F
+        rd = (ins >> 11) & 0x1F
+        sa = (ins >> 6) & 0x1F
+        fn = ins & 0x3F
+        imm = ins & 0xFFFF
+        simm = imm - 0x10000 if (imm & 0x8000) else imm
+        g = self.gpr
+
+        if op == 0x00:  # SPECIAL
+            if fn == 0x00:    g[rd] = (g[rt] << sa) & 0xFFFFFFFF               # SLL
+            elif fn == 0x02:  g[rd] = (g[rt] & 0xFFFFFFFF) >> sa               # SRL
+            elif fn == 0x03:  g[rd] = (self._s32(g[rt]) >> sa) & 0xFFFFFFFF    # SRA
+            elif fn == 0x04:  g[rd] = (g[rt] << (g[rs] & 31)) & 0xFFFFFFFF     # SLLV
+            elif fn == 0x06:  g[rd] = (g[rt] & 0xFFFFFFFF) >> (g[rs] & 31)     # SRLV
+            elif fn == 0x07:  g[rd] = (self._s32(g[rt]) >> (g[rs] & 31)) & 0xFFFFFFFF
+            elif fn == 0x08:  target_next = g[rs] & 0xFFFFFFFF                 # JR
+            elif fn == 0x09:  tmp = g[rs] & 0xFFFFFFFF; g[rd] = (cur_next + 4) & 0xFFFFFFFF; target_next = tmp  # JALR
+            elif fn == 0x10:  g[rd] = self.hi                                  # MFHI
+            elif fn == 0x11:  self.hi = g[rs]                                  # MTHI
+            elif fn == 0x12:  g[rd] = self.lo                                  # MFLO
+            elif fn == 0x13:  self.lo = g[rs]                                  # MTLO
+            elif fn in (0x18, 0x19):                                           # MULT / MULTU
+                a = self._s32(g[rs]) if fn == 0x18 else (g[rs] & 0xFFFFFFFF)
+                b = self._s32(g[rt]) if fn == 0x18 else (g[rt] & 0xFFFFFFFF)
+                prod = (a * b) & 0xFFFFFFFFFFFFFFFF
+                self.lo = prod & 0xFFFFFFFF
+                self.hi = (prod >> 32) & 0xFFFFFFFF
+            elif fn in (0x1A, 0x1B):                                           # DIV / DIVU
+                a = self._s32(g[rs]) if fn == 0x1A else (g[rs] & 0xFFFFFFFF)
+                b = self._s32(g[rt]) if fn == 0x1A else (g[rt] & 0xFFFFFFFF)
+                if b != 0:
+                    q = int(a / b)
+                    self.lo = q & 0xFFFFFFFF
+                    self.hi = (a - q * b) & 0xFFFFFFFF
+            elif fn in (0x20, 0x21): g[rd] = (g[rs] + g[rt]) & 0xFFFFFFFF      # ADD / ADDU
+            elif fn in (0x22, 0x23): g[rd] = (g[rs] - g[rt]) & 0xFFFFFFFF      # SUB / SUBU
+            elif fn == 0x24:  g[rd] = g[rs] & g[rt]                            # AND
+            elif fn == 0x25:  g[rd] = g[rs] | g[rt]                            # OR
+            elif fn == 0x26:  g[rd] = g[rs] ^ g[rt]                            # XOR
+            elif fn == 0x27:  g[rd] = (~(g[rs] | g[rt])) & 0xFFFFFFFF          # NOR
+            elif fn == 0x2A:  g[rd] = 1 if self._s32(g[rs]) < self._s32(g[rt]) else 0  # SLT
+            elif fn == 0x2B:  g[rd] = 1 if (g[rs] & 0xFFFFFFFF) < (g[rt] & 0xFFFFFFFF) else 0  # SLTU
+        elif op == 0x01:  # REGIMM (BLTZ, BGEZ, BLTZAL, BGEZAL)
+            cond = (self._s32(g[rs]) < 0) if ((rt & 1) == 0) else (self._s32(g[rs]) >= 0)
+            if rt & 0x10:
+                g[31] = (cur_next + 4) & 0xFFFFFFFF
+            if cond:
+                target_next = (cur_next + (simm << 2)) & 0xFFFFFFFF
+        elif op == 0x02:  # J
+            target_next = (cur_next & 0xF0000000) | ((ins & 0x03FFFFFF) << 2)
+        elif op == 0x03:  # JAL
+            g[31] = (cur_next + 4) & 0xFFFFFFFF
+            target_next = (cur_next & 0xF0000000) | ((ins & 0x03FFFFFF) << 2)
+        elif op == 0x04:  # BEQ
+            if (g[rs] & 0xFFFFFFFF) == (g[rt] & 0xFFFFFFFF):
+                target_next = (cur_next + (simm << 2)) & 0xFFFFFFFF
+        elif op == 0x05:  # BNE
+            if (g[rs] & 0xFFFFFFFF) != (g[rt] & 0xFFFFFFFF):
+                target_next = (cur_next + (simm << 2)) & 0xFFFFFFFF
+        elif op == 0x06:  # BLEZ
+            if self._s32(g[rs]) <= 0:
+                target_next = (cur_next + (simm << 2)) & 0xFFFFFFFF
+        elif op == 0x07:  # BGTZ
+            if self._s32(g[rs]) > 0:
+                target_next = (cur_next + (simm << 2)) & 0xFFFFFFFF
+        elif op in (0x08, 0x09): g[rt] = (g[rs] + simm) & 0xFFFFFFFF           # ADDI / ADDIU
+        elif op == 0x0A:  g[rt] = 1 if self._s32(g[rs]) < simm else 0          # SLTI
+        elif op == 0x0B:  g[rt] = 1 if (g[rs] & 0xFFFFFFFF) < (simm & 0xFFFFFFFF) else 0  # SLTIU
+        elif op == 0x0C:  g[rt] = g[rs] & imm                                  # ANDI
+        elif op == 0x0D:  g[rt] = g[rs] | imm                                  # ORI
+        elif op == 0x0E:  g[rt] = g[rs] ^ imm                                  # XORI
+        elif op == 0x0F:  g[rt] = (imm << 16) & 0xFFFFFFFF                     # LUI
+        elif op == 0x10:  # COP0
+            if rs == 0x00: g[rt] = self.cp0[rd]
+            elif rs == 0x04: self.cp0[rd] = g[rt]
+        elif op in (0x14, 0x15, 0x16, 0x17):  # BEQL, BNEL, BLEZL, BGTZL
+            cond = (
+                ((g[rs] & 0xFFFFFFFF) == (g[rt] & 0xFFFFFFFF)) if op == 0x14 else
+                (((g[rs] & 0xFFFFFFFF) != (g[rt] & 0xFFFFFFFF)) if op == 0x15 else
+                 ((self._s32(g[rs]) <= 0) if op == 0x16 else (self._s32(g[rs]) > 0)))
+            )
+            if cond:
+                target_next = (cur_next + (simm << 2)) & 0xFFFFFFFF
+            else:
+                cur_next = (cur_next + 4) & 0xFFFFFFFF
+                target_next = (cur_next + 4) & 0xFFFFFFFF
+        elif op == 0x20:  v = self.read8((g[rs] + simm) & 0xFFFFFFFF); g[rt] = (v | 0xFFFFFF00) if (v & 0x80) else v
+        elif op == 0x21:  v = self.read16((g[rs] + simm) & 0xFFFFFFFF); g[rt] = (v | 0xFFFF0000) if (v & 0x8000) else v
+        elif op == 0x23:  g[rt] = self.read32((g[rs] + simm) & 0xFFFFFFFF)
+        elif op == 0x24:  g[rt] = self.read8((g[rs] + simm) & 0xFFFFFFFF)
+        elif op == 0x25:  g[rt] = self.read16((g[rs] + simm) & 0xFFFFFFFF)
+        elif op == 0x28:  self.write8((g[rs] + simm) & 0xFFFFFFFF, g[rt])
+        elif op == 0x29:  self.write16((g[rs] + simm) & 0xFFFFFFFF, g[rt])
+        elif op == 0x2B:  self.write32((g[rs] + simm) & 0xFFFFFFFF, g[rt])
+
+        g[0] = 0
+        self.pc = cur_next
+        self.next_pc = target_next
+
+    def _raster_n64_triangles(self, fb):
+        """Very small software rasterizer: pull a few 3D points from DMEM/RDRAM
+        and draw filled triangles with simple depth shading. Not a full RDP."""
+        # Prefer DMEM (RSP scratch) then a slice of RDRAM for vertex-like data.
+        src = self.sp_dmem if any(self.sp_dmem) else self.rdram[0x1000:0x2000]
+        if not any(src):
+            return
+        # Interpret groups of 6 bytes as (x,y,z, x,y,z) in 0-255, project to screen.
+        n = min(12, len(src) // 6)
+        if n < 1:
+            return
+        pts = []
+        for i in range(n):
+            b = src[i*6:i*6+6]
+            x, y, z = b[0], b[1], max(1, b[2])
+            # Simple perspective: divide by z, center on screen.
+            sx = int(160 + (x - 128) * 80 / z)
+            sy = int(120 + (y - 128) * 80 / z)
+            pts.append((sx, sy, z))
+        # Draw triangles between consecutive triples.
+        for i in range(0, len(pts) - 2, 3):
+            p0, p1, p2 = pts[i], pts[i+1], pts[i+2]
+            self._fill_tri(fb, p0, p1, p2)
+
+    def _fill_tri(self, fb, p0, p1, p2):
+        # Bounding box clip
+        xs = [p0[0], p1[0], p2[0]]
+        ys = [p0[1], p1[1], p2[1]]
+        minx, maxx = max(0, min(xs)), min(319, max(xs))
+        miny, maxy = max(0, min(ys)), min(239, max(ys))
+        if maxx <= minx or maxy <= miny:
+            return
+        # Depth shade from average z
+        z = (p0[2] + p1[2] + p2[2]) // 3
+        shade = max(40, 255 - z)
+        col = (shade, shade // 2, 255 - shade // 3, 255)
+        # Edge function fill (barycentric-ish)
+        def edge(ax, ay, bx, by, cx, cy):
+            return (cx - ax) * (by - ay) - (cy - ay) * (bx - ax)
+        area = edge(p0[0], p0[1], p1[0], p1[1], p2[0], p2[1])
+        if area == 0:
+            return
+        for y in range(miny, maxy + 1):
+            for x in range(minx, maxx + 1):
+                w0 = edge(p1[0], p1[1], p2[0], p2[1], x, y)
+                w1 = edge(p2[0], p2[1], p0[0], p0[1], x, y)
+                w2 = edge(p0[0], p0[1], p1[0], p1[1], x, y)
+                if (w0 >= 0 and w1 >= 0 and w2 >= 0) or (w0 <= 0 and w1 <= 0 and w2 <= 0):
+                    fb[y, x] = col
+
+    def _render_frame(self):
+        fb_origin = self.vi_regs[1] & 0x007FFFFE
+        vi_ctrl = self.vi_regs[0]
+        bpp32 = (vi_ctrl & 3) == 3
+        need = 320 * 240 * (4 if bpp32 else 2)
+        if fb_origin + need <= len(self.rdram):
+            chunk = self.rdram[fb_origin:fb_origin + need]
+            if any(chunk):
+                if bpp32:
+                    arr = np.frombuffer(chunk, dtype=np.uint8).reshape((240, 320, 4))
+                    self.frame_rgba[:] = arr
+                    self.frame_rgba[:, :, 3] = 255
+                    return
+                else:
+                    px16 = np.frombuffer(chunk, dtype=">u2").reshape((240, 320))
+                    self.frame_rgba[:, :, 0] = (((px16 >> 11) & 0x1F) << 3) | (((px16 >> 11) & 0x1F) >> 2)
+                    self.frame_rgba[:, :, 1] = (((px16 >> 6) & 0x1F) << 3) | (((px16 >> 6) & 0x1F) >> 2)
+                    self.frame_rgba[:, :, 2] = (((px16 >> 1) & 0x1F) << 3) | (((px16 >> 1) & 0x1F) >> 2)
+                    self.frame_rgba[:, :, 3] = 255
+                    return
+
+        # 3D fallback: rasterize triangles from RDRAM/DMEM when VI has no image
+        fb = self.frame_rgba
+        self._raster_n64_triangles(fb)
+        if fb[:, :, :3].any():
+            return
+        # Last resort: paint a dim gradient so the window is never pure black
+        yy = np.arange(240, dtype=np.int32)[:, None]
+        xx = np.arange(320, dtype=np.int32)[None, :]
+        fb[:, :, 0] = np.clip(12 + (yy >> 4), 0, 40).astype(np.uint8)
+        fb[:, :, 1] = np.clip(16 + (xx >> 5), 0, 40).astype(np.uint8)
+        fb[:, :, 2] = np.clip(32 + (yy >> 3), 0, 64).astype(np.uint8)
+        fb[:, :, 3] = 255
+        return
+        # Render N64 ROM Header + RSP/RDP Status Banner when homebrew/ROM has not written VI framebuffer yet
+        yy = np.arange(240, dtype=np.int32)[:, None]
+        xx = np.arange(320, dtype=np.int32)[None, :]
+        fb[:, :, 0] = np.clip(18 + (yy >> 3), 0, 255).astype(np.uint8)
+        fb[:, :, 1] = np.clip(24 + (xx >> 4), 0, 255).astype(np.uint8)
+        fb[:, :, 2] = np.clip(58 + (yy >> 2), 0, 255).astype(np.uint8)
+        fb[:, :, 3] = 255
+        # Draw classic 4-color N64 'N' emblem in center
+        cx, cy = 160, 110
+        fb[cy - 28:cy + 28, cx - 28:cx - 16] = (220, 48, 48, 255)   # Red left pillar
+        fb[cy - 28:cy + 28, cx + 16:cx + 28] = (48, 185, 72, 255)   # Green right pillar
+        for d in range(36):
+            px = cx - 18 + d
+            py = cy - 22 + int(d * 1.2)
+            fb[py:py + 10, px:px + 6] = (48, 110, 235, 255)          # Blue diagonal
+        fb[cy + 24:cy + 28, cx - 28:cx + 28] = (242, 200, 42, 255)  # Gold base bar
+
+    def capture_state(self):
+        return {
+            "gpr": list(self.gpr), "cp0": list(self.cp0), "hi": self.hi, "lo": self.lo,
+            "pc": self.pc, "next_pc": self.next_pc,
+            "vi": list(self.vi_regs), "pi": list(self.pi_regs),
+            "ai": list(self.ai_regs), "si": list(self.si_regs), "mi": list(self.mi_regs),
+            "rdram_z": zlib.compress(bytes(self.rdram), 1),
+            "sp_dmem": bytes(self.sp_dmem), "sp_imem": bytes(self.sp_imem),
+            "pif_ram": bytes(self.pif_ram),
+            "buttons": self.buttons, "frames": self.frames,
+            "frame_rgba": self.frame_rgba.copy(),
+        }
+
+    def restore_state(self, st):
+        self.gpr[:] = st["gpr"]
+        self.cp0[:] = st["cp0"]
+        self.hi = st["hi"]
+        self.lo = st["lo"]
+        self.pc = st["pc"]
+        self.next_pc = st["next_pc"]
+        self.vi_regs[:] = st["vi"]
+        if "pi" in st:
+            self.pi_regs[:] = st["pi"]
+        if "ai" in st:
+            self.ai_regs[:] = st["ai"]
+        if "si" in st:
+            self.si_regs[:] = st["si"]
+        if "mi" in st:
+            self.mi_regs[:] = st["mi"]
+        if "rdram_z" in st:
+            self.rdram[:] = zlib.decompress(st["rdram_z"])
+        elif "rdram" in st:
+            self.rdram[:] = st["rdram"]
+        if "sp_dmem" in st:
+            self.sp_dmem[:] = st["sp_dmem"]
+        if "sp_imem" in st:
+            self.sp_imem[:] = st["sp_imem"]
+        if "pif_ram" in st:
+            self.pif_ram[:] = st["pif_ram"]
+        self.buttons = st.get("buttons", 0)
+        self.frames = st.get("frames", self.frames)
+        if "frame_rgba" in st:
+            self.frame_rgba[:] = st["frame_rgba"]
+
+    def save_state(self, path=None):
+        path = path or self.base_path + ".n64state"
+        with open(path, "wb") as f:
+            pickle.dump(self.capture_state(), f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def load_state(self, path=None):
+        path = path or self.base_path + ".n64state"
+        if not os.path.exists(path):
+            return False
+        with open(path, "rb") as f:
+            self.restore_state(pickle.load(f))
+        return True
+
+    def run_frame(self, draw=True):
+        step = self.step
+        for _ in range(4000):
+            prev_pc = self.pc
+            step()
+            if self.pc == prev_pc and self.next_pc == prev_pc:
+                break
+        if draw:
+            self._render_frame()
+        self.apu.run_frame()
+        self.frames += 1
+
+    def get_rgba(self):
+        return self.frame_rgba
+
+
 def load_console(rom_path, sample_rate=44100):
     ext = os.path.splitext(rom_path)[1].lower()
+    if ext in (".fds", ".fam", ".unf"):
+        return Famicom(rom_path, sample_rate)
+    if ext in (".z64", ".n64", ".v64"):
+        return Nintendo64(rom_path, sample_rate)
     if ext in (".sfc", ".smc", ".snes"):
+        # Built-in vectorized SNES. For higher accuracy (full color math, windows, mosaic,
+        # more complete HDMA, etc.) you can integrate https://github.com/eduardovra/PySNES
+        # (MIT). Example future path:
+        # try:
+        #     from pysnes.pysnes import PySNES
+        #     return PySNESAdapter(rom_path, sample_rate)  # wrapper implementing width/height/run_frame/get_rgba/...
+        # except ImportError:
+        #     pass
         return SNES(rom_path, sample_rate)
     if ext in (".gb", ".gbc"):
         return GameBoy(rom_path, sample_rate)
@@ -5577,6 +6720,10 @@ def load_console(rom_path, sample_rate=44100):
         return NES(rom_path, sample_rate)
     with open(rom_path, "rb") as f:
         hdr = f.read(512)
+    if hdr[:4] == b"FDS\x1a":
+        return Famicom(rom_path, sample_rate)
+    if hdr[:4] in (b"\x80\x37\x12\x40", b"\x37\x80\x40\x12", b"\x40\x12\x37\x80"):
+        return Nintendo64(rom_path, sample_rate)
     if hdr[:4] == b"NES\x1a":
         return NES(rom_path, sample_rate)
     if len(hdr) >= 0x134 and hdr[0x104:0x108] == b"\xCE\xED\x66\x66":
@@ -5584,7 +6731,6 @@ def load_console(rom_path, sample_rate=44100):
     if len(hdr) >= 0xA0 and hdr[0x04:0x08] == b"\x24\xFF\xAE\x51":
         return GameBoyAdvance(rom_path, sample_rate)
     return SNES(rom_path, sample_rate)
-
 
 
 # ==========================================================================
@@ -5649,11 +6795,12 @@ HELP_ROWS = [
     ("P", "Pause / resume"), ("R", "Reset"),
     ("M", "Mute"), ("F", "Smooth / pixel filter"), ("V", "Start / stop AVI recording"),
     ("F5 / F7", "Save / load state"), ("F11", "Fullscreen"), ("F12", "Screenshot"),
-    ("Ctrl+O", "Open ROM (.nes/.sfc/.snes/.gb/.gbc/.gba)"), ("Esc", "Close menu / quit"),
+    ("Ctrl+O", "Open ROM (NES/Famicom/SNES/N64/GB/GBC/GBA)"), ("Esc", "Close menu / quit"),
 ]
 ABOUT_ROWS = [
     ("PyRetro", "Multi-Console Emulator in Python + Arcade"),
     ("NES / SNES", "6502 + 2C02 PPU / 65c816 + Vectorized S-PPU"),
+    ("Famicom / N64", "FDS Disk System / MIPS VR4300i + VI/RDP"),
     ("GB / GBC / GBA", "LR35902 + DMG/CGB PPU / ARM7TDMI + GBA PPU"),
 ]
 
@@ -5674,6 +6821,8 @@ class RetroWindow(arcade.Window if arcade else object):
     def __init__(self, console, scale=3, audio=True, aspect="square", max_catchup=6,
                  vsync=True, audio_latency=0.075, audio_backend="auto"):
         self.console = console
+        self.settings = Settings()
+        self.settings.apply_to(console)
         self.aspect = aspect
         self.par = 8.0 / 7.0 if aspect == "ntsc" else 1.0
         self.max_catchup = max_catchup
@@ -5682,8 +6831,13 @@ class RetroWindow(arcade.Window if arcade else object):
         sys_tag = f"[{console.system_name}] " if console else ""
         self.title_base = f"PyRetro {sys_tag}" + ("- " + os.path.basename(console.rom_path) if console else "")
         super().__init__(int(cw * scale * self.par), ch * scale + MENU_H, self.title_base,
-                         resizable=True, update_rate=1 / 120, vsync=vsync)
+                         resizable=True, update_rate=(1.0 / 60.0 if vsync else 1.0 / 120.0), vsync=vsync)
         self.use_vsync = vsync
+        try:
+            self.set_vsync(self.use_vsync)
+            self.set_update_rate(1.0 / 60.0 if self.use_vsync else 1.0 / 120.0)
+        except Exception:
+            pass
         self.keymap = _keymap()
         self.keys = 0
         self.paused = False
@@ -5704,7 +6858,9 @@ class RetroWindow(arcade.Window if arcade else object):
         self._rewind_tick = 0
         self.speed_multiplier = 1.0
         self.reverse_speed = False
-        self.rewind_history = deque(maxlen=600)
+        # N64 stores 8 MB RDRAM per entry; keep a short history to stay under ~0.5 GB.
+        # Other systems stay at 600 frames (~10 s).
+        self.rewind_history = deque(maxlen=self._rewind_maxlen_for(console))
         self.rewind_acc = 0.0
         self._audio_capture = []
         self._forward_audio_phase = 0.0
@@ -5714,6 +6870,8 @@ class RetroWindow(arcade.Window if arcade else object):
         self.ui_anim_last = time.perf_counter()
         self.ui_frame_dt = 0.0
         self.ui_modal_close = None
+        self._overlay_drag = None
+        self._overlay_off = [0.0, 0.0]
         self.recording = False
         self.video_writer = None
         self.record_path = None
@@ -5754,6 +6912,8 @@ class RetroWindow(arcade.Window if arcade else object):
         self.ui_menus = None
         self.ui_title_x = []
         self.ui_drop_w = []
+        self.ui_menu_scroll = 0.0   # pixels scrolled inside open dropdown
+        self.ui_overlay_scroll = 0.0  # pixels scrolled inside Help/About modal
         self.ui_reflow()
 
     def _ensure_texture_size(self):
@@ -5765,6 +6925,20 @@ class RetroWindow(arcade.Window if arcade else object):
             filt = self.ctx.LINEAR if self.smooth else self.ctx.NEAREST
             self.texture = self.ctx.texture(want, components=4, data=bytes(want[0] * want[1] * 4),
                                             filter=(filt, filt))
+
+    @staticmethod
+    def _rewind_maxlen_for(console):
+        """N64 RDRAM is 8 MB; 60 frames ≈ 480 MB max. Other systems stay at 600."""
+        if console is not None and getattr(console, "system_name", "") == "N64":
+            return 60
+        return 600
+
+    def _reset_rewind_history(self):
+        maxlen = self._rewind_maxlen_for(self.console)
+        if self.rewind_history.maxlen != maxlen:
+            self.rewind_history = deque(maxlen=maxlen)
+        else:
+            self.rewind_history.clear()
 
     def ui_build_menus(self):
         def it(label, fn, key="", check=None):
@@ -5785,38 +6959,109 @@ class RetroWindow(arcade.Window if arcade else object):
             it("Record AVI Video", self.act_toggle_record, "V", check=lambda: self.recording), None,
             it("Exit", self.close, "Esc"),
         ]
-        emu_m = [
+        game_m = [
             it("Pause", self.act_pause, "P", check=lambda: self.paused),
             it("Reset", self.act_reset, "R"),
+            it("Power Cycle", self.act_reset),
+            None,
             it("Fast Forward", self.act_turbo, "Tab", check=lambda: self.turbo),
-            it("Reverse / Rewind", self.act_reverse, "Backslash", check=lambda: self.reverse_speed),
-            None,
-            *[it(f"Emulation Speed {v:g}x", lambda v=v: self.act_speed(v),
-                 check=lambda v=v: abs(self.speed_multiplier - v) < 1e-6)
-              for v in (0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0)],
+            it("Rewind", self.act_reverse, "Backslash", check=lambda: self.reverse_speed),
         ]
-        vid_m = [size_item(s) for s in (1, 2, 3, 4, 5, 6)] + [
+        # Settings matches the MesenCE menu: Speed, Video Size, Filter, Aspect,
+        # Region, then Audio/Emulation/Input/Video, then per-system, then Preferences.
+        settings_m = [
+            it("Speed", lambda: self.ui_show("Speed", [
+                (f"{v:g}x", "current" if abs(self.speed_multiplier - v) < 1e-6 else "")
+                for v in (0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0)
+            ])),
+            it("Video Size", lambda: self.ui_show("Video Size", [
+                (f"{s}x", f"{int(cw * s * self.par)} x {ch * s}") for s in (1, 2, 3, 4, 5, 6)
+            ])),
+            it("Video Filter", lambda: self.ui_show("Video Filter", [
+                ("None", ""), ("Smooth", "bilinear"), ("NTSC", "composite")
+            ])),
+            it("Aspect Ratio", lambda: self.ui_show("Aspect Ratio", [
+                ("Square Pixels", "1:1"), ("NTSC 8:7", "8:7"), ("4:3", "4:3")
+            ])),
+            it("Region / Model", lambda: self.ui_show("Region / Model", [
+                ("Auto", ""), ("NTSC", "60 Hz"), ("PAL", "50 Hz"), ("Dendy", "50 Hz")
+            ])),
             None,
-            it("Fullscreen", self.act_fullscreen, "F11", check=lambda: self.fullscreen),
-            it("Smooth Scaling", self.act_smooth, "F", check=lambda: self.smooth),
-            it("VSync", self.act_vsync, check=lambda: self.use_vsync),
+            it("Show FPS", lambda: setattr(self.settings, "show_fps", not self.settings.show_fps),
+               check=lambda: self.settings.show_fps),
+            it("Show frame counter", lambda: setattr(self.settings, "show_frame_counter", not self.settings.show_frame_counter),
+               check=lambda: self.settings.show_frame_counter),
+            it("Show game timer", lambda: setattr(self.settings, "show_game_timer", not self.settings.show_game_timer),
+               check=lambda: self.settings.show_game_timer),
+            it("Show lag counter", lambda: setattr(self.settings, "show_lag_counter", not self.settings.show_lag_counter),
+               check=lambda: self.settings.show_lag_counter),
+            it("Hide on-screen messages", lambda: setattr(self.settings, "hide_osd", not self.settings.hide_osd),
+               check=lambda: self.settings.hide_osd),
             None,
-            it("Square Pixels", lambda: self.act_aspect("square"), check=lambda: self.aspect == "square"),
-            it("NTSC 8:7 Pixels", lambda: self.act_aspect("ntsc"), check=lambda: self.aspect == "ntsc"),
+            it("Audio", lambda: self.ui_show("Audio", [
+                ("Mute", "on" if self.muted else "off"),
+                ("Volume", f"{int(self.volume * 100)}%"),
+                ("Latency", f"{int(self.audio_target * 1000)} ms"),
+                ("Stereo effect", self.settings.audio_stereo),
+            ])),
+            it("Emulation", lambda: self.ui_show("Emulation", [
+                ("Pause", "on" if self.paused else "off"),
+                ("Speed", f"{self.speed_multiplier:g}x"),
+                ("Rewind", "on" if self.reverse_speed else "off"),
+            ])),
+            it("Input", lambda: self.ui_show("Input", [
+                ("Keyboard", "mapped"), ("Controller", "auto"),
+            ])),
+            it("Video", lambda: self.ui_show("Video", [
+                ("Fullscreen", "on" if self.fullscreen else "off"),
+                ("VSync", "on" if self.use_vsync else "off"),
+                ("Smooth", "on" if self.smooth else "off"),
+                ("Backend", self.settings.video_backend),
+            ])),
+            None,
+            it("NES: remove sprite limit", lambda: setattr(self.settings, "nes_remove_sprite_limit", not self.settings.nes_remove_sprite_limit),
+               check=lambda: self.settings.nes_remove_sprite_limit),
+            it("NES: disable background", lambda: setattr(self.settings, "nes_disable_bg", not self.settings.nes_disable_bg),
+               check=lambda: self.settings.nes_disable_bg),
+            it("NES: disable sprites", lambda: setattr(self.settings, "nes_disable_sprites", not self.settings.nes_disable_sprites),
+               check=lambda: self.settings.nes_disable_sprites),
+            it("SNES", lambda: self.ui_show("SNES", [
+                ("Power-on RAM", self.settings.snes_poweron_ram),
+                ("SPC clock", str(self.settings.snes_spc_clock)),
+                ("Strict boards", "on" if self.settings.snes_strict_boards else "off"),
+            ])),
+            it("Game Boy", lambda: self.ui_show("Game Boy", [("Model", "auto"), ("SGB", "off")])),
+            it("GBA", lambda: self.ui_show("GBA", [("BIOS", "HLE"), ("RTC", "on")])),
+            it("PC Engine", lambda: self.ui_show("PC Engine", [("not yet", "")])),
+            it("SMS", lambda: self.ui_show("SMS", [("not yet", "")])),
+            it("WonderSwan", lambda: self.ui_show("WonderSwan", [("not yet", "")])),
+            it("Other systems", lambda: self.ui_show("Other systems", [
+                ("N64", "VI + software raster"), ("GBA", "ARM7 + DirectSound"),
+                ("FDS", "disk loader"),
+            ])),
+            None,
+            it("Preferences", lambda: self.ui_show("Preferences", [
+                ("Show FPS", "on" if self.settings.show_fps else "off"),
+                ("Show frame counter", "on" if self.settings.show_frame_counter else "off"),
+                ("Autosave", f"{self.settings.autosave_minutes} min"),
+                ("Rewind memory", f"{self.settings.rewind_mb} MB"),
+            ])),
         ]
-        aud_m = [it("Mute", self.act_mute, "M", check=lambda: self.muted), None] + [
-            it(f"Volume {int(v * 100)}%", lambda v=v: self.act_volume(v),
-               check=lambda v=v: abs(self.volume - v) < 1e-6) for v in (1.0, 0.75, 0.5, 0.25)]
-        aud_m += [None] + [
-            it(f"Audio Latency {int(ms)} ms", lambda ms=ms: self.act_audio_latency(ms),
-               check=lambda ms=ms: abs(self.audio_target * 1000 - ms) < 0.5)
-            for ms in (15, 20, 25, 35, 50, 75)]
+        tools_m = [
+            it("Screenshot", self.act_screenshot, "F12"),
+            it("Record AVI", self.act_toggle_record, "V", check=lambda: self.recording),
+        ]
+        debug_m = [
+            it("Show debug info", lambda: self.ui_notify(
+                f"PC debug: frames={getattr(self.console, 'frames', 0)}"),
+               check=lambda: self.settings.show_debug),
+        ]
         help_m = [
             it("Controls...", lambda: self.ui_show("Controls", HELP_ROWS)),
             it("About", lambda: self.ui_show("About", ABOUT_ROWS)),
         ]
-        return [("File", file_m), ("Emulation", emu_m), ("Video", vid_m),
-                ("Audio", aud_m), ("Help", help_m)]
+        return [("File", file_m), ("Game", game_m), ("Settings", settings_m),
+                ("Tools", tools_m), ("Debug", debug_m), ("Help", help_m)]
 
     def ui_reflow(self):
         self.ui_menus = self.ui_build_menus()
@@ -5839,6 +7084,7 @@ class RetroWindow(arcade.Window if arcade else object):
     def ui_show(self, title, rows):
         self.ui_overlay = (title, rows)
         self._last_overlay = (title, rows)
+        self.ui_overlay_scroll = 0.0
 
     def ui_cur_scale(self):
         if self.fullscreen:
@@ -5948,7 +7194,7 @@ class RetroWindow(arcade.Window if arcade else object):
             old.apu.sink = None
         self.console = new
         self._ensure_texture_size()
-        self.rewind_history.clear()
+        self._reset_rewind_history()
         self.title_base = f"PyRetro [{new.system_name}] - " + os.path.basename(path)
         self.set_caption(self.title_base)
         self.paused = False
@@ -6017,7 +7263,7 @@ class RetroWindow(arcade.Window if arcade else object):
     def act_reset(self):
         if self.console:
             self.console.reset()
-            self.rewind_history.clear()
+            self._reset_rewind_history()
             self.rewind_acc = 0.0
             self.ui_notify("Reset")
 
@@ -6088,6 +7334,7 @@ class RetroWindow(arcade.Window if arcade else object):
             self.use_vsync = bool(value)
         try:
             self.set_vsync(self.use_vsync)
+            self.set_update_rate(1.0 / 60.0 if self.use_vsync else 1.0 / 120.0)
         except Exception:
             pass
         self.slow_secs = 0
@@ -6190,13 +7437,32 @@ class RetroWindow(arcade.Window if arcade else object):
         return None
 
     def ui_rows(self, i, wh):
+        """Return (rows, content_bottom, max_scroll).
+        rows are (item, y_top, y_bottom) already shifted by ui_menu_scroll and
+        clipped so the dropdown never extends past the bottom of the window.
+        """
+        max_drop_h = max(80, wh - MENU_H - 8)
         y = wh - MENU_H
         rows = []
         for item in self.ui_menus[i][1]:
             h = SEP_H if item is None else ITEM_H
             rows.append((item, y, y - h))
             y -= h
-        return rows, y
+        content_h = (wh - MENU_H) - y
+        max_scroll = max(0.0, content_h - max_drop_h)
+        scroll = max(0.0, min(self.ui_menu_scroll, max_scroll))
+        self.ui_menu_scroll = scroll
+        # Shift all rows up by scroll amount; drop area ends at max_drop_h below the bar
+        vis_bottom = wh - MENU_H - max_drop_h
+        shifted = []
+        for item, yt, yb in rows:
+            nyt = yt + scroll
+            nyb = yb + scroll
+            # Keep only rows that intersect the visible drop region
+            if nyt > wh - MENU_H or nyb < vis_bottom:
+                continue
+            shifted.append((item, nyt, nyb))
+        return shifted, vis_bottom, max_scroll
 
     def ui_hit_item(self, x, y, wh):
         i = self.ui_open
@@ -6205,27 +7471,83 @@ class RetroWindow(arcade.Window if arcade else object):
         x0 = self.ui_title_x[i][0]
         if not (x0 <= x < x0 + self.ui_drop_w[i]):
             return None
-        for item, yt, yb in self.ui_rows(i, wh)[0]:
+        rows, vis_bottom, _ = self.ui_rows(i, wh)
+        if y < vis_bottom or y > wh - MENU_H:
+            return None
+        for item, yt, yb in rows:
             if item is not None and yb <= y < yt:
                 return item
         return None
 
     def on_mouse_motion(self, x, y, dx, dy):
         self.ui_ptr = (x, y)
+        if getattr(self, "_overlay_drag", None) is not None:
+            ox, oy = self._overlay_drag
+            self._overlay_off[0] = x - ox
+            self._overlay_off[1] = y - oy
+            return
         if self.ui_open is not None:
             t = self.ui_hit_title(x, y, self.get_size()[1])
-            if t is not None:
+            if t is not None and t != self.ui_open:
                 self.ui_open = t
+                self.ui_menu_scroll = 0.0
 
     def on_mouse_leave(self, x, y):
         self.ui_ptr = (-1, -1)
 
+    def _overlay_select(self, label, value):
+        """Act on a clicked popup row."""
+        lab = str(label).strip()
+        # Speed like "1.0x" or "2x"
+        if lab.endswith("x") and lab[:-1].replace(".", "", 1).isdigit():
+            try:
+                self.act_speed(float(lab[:-1]))
+                self.ui_notify(f"Speed {lab}")
+                return
+            except Exception:
+                pass
+        # Scale like "3x" already handled above; size rows are "1x".."6x"
+        if lab in ("Square Pixels", "NTSC 8:7", "4:3"):
+            self.act_aspect({"Square Pixels": "square", "NTSC 8:7": "ntsc", "4:3": "square"}.get(lab, "square"))
+            self.ui_notify(f"Aspect {lab}")
+            return
+        if lab in ("None", "Smooth", "NTSC"):
+            if lab == "Smooth":
+                self.act_smooth()
+            self.ui_notify(f"Filter {lab}")
+            return
+        if lab in ("Auto", "NTSC", "PAL", "Dendy"):
+            self.ui_notify(f"Region {lab}")
+            return
+        # Toggle-looking rows
+        if str(value).lower() in ("on", "off", "true", "false", "yes", "no"):
+            self.ui_notify(f"{lab}: {value}")
+            return
+        self.ui_notify(f"Selected {lab}")
+
+    def on_mouse_release(self, x, y, button, modifiers):
+        self._overlay_drag = None
+
     def on_mouse_press(self, x, y, button, modifiers):
         self.ui_ptr = (x, y)
         if self.ui_overlay is not None:
-            if self.ui_modal_close and self.ui_modal_close[0] <= x <= self.ui_modal_close[2] and self.ui_modal_close[1] <= y <= self.ui_modal_close[3]:
+            # Close button (generous hit area)
+            cb = self.ui_modal_close
+            if cb and (cb[0] - 6) <= x <= (cb[2] + 6) and (cb[1] - 6) <= y <= (cb[3] + 6):
                 self.ui_overlay = None
                 self.ui_modal_close = None
+                self._overlay_drag = None
+                return
+            # Selectable row
+            for x0, y0, x1, y1, label, value in getattr(self, "_overlay_row_hits", []):
+                if x0 <= x <= x1 and y0 <= y <= y1:
+                    self._overlay_select(label, value)
+                    return
+            # Drag by title bar
+            tb = getattr(self, "_overlay_titlebar", None)
+            if tb and tb[0] <= x <= tb[2] and tb[1] <= y <= tb[3]:
+                self._overlay_drag = (x - self._overlay_off[0], y - self._overlay_off[1])
+                return
             return
         wh = self.get_size()[1]
         if button != arcade.MOUSE_BUTTON_LEFT:
@@ -6233,7 +7555,11 @@ class RetroWindow(arcade.Window if arcade else object):
             return
         t = self.ui_hit_title(x, y, wh)
         if t is not None:
-            self.ui_open = None if self.ui_open == t else t
+            if self.ui_open == t:
+                self.ui_open = None
+            else:
+                self.ui_open = t
+                self.ui_menu_scroll = 0.0
             return
         if self.ui_open is not None:
             item = self.ui_hit_item(x, y, wh)
@@ -6243,6 +7569,22 @@ class RetroWindow(arcade.Window if arcade else object):
                     item["fn"]()
                 except Exception as e:
                     self.ui_notify(f"{item['label']} failed: {e}")
+
+    def on_mouse_scroll(self, x, y, scroll_x, scroll_y):
+        """Scroll open dropdown menus and Help/About overlays with the mouse wheel."""
+        wh = self.get_size()[1]
+        delta = scroll_y * 28.0
+        if self.ui_overlay is not None:
+            cap = getattr(self, "_overlay_max_scroll", 4000.0)
+            self.ui_overlay_scroll = max(0.0, min(cap, self.ui_overlay_scroll + delta))
+            return
+        if self.ui_open is not None and self.ui_menus:
+            items = self.ui_menus[self.ui_open][1]
+            content_h = sum(SEP_H if it is None else ITEM_H for it in items)
+            max_drop_h = max(80, wh - MENU_H - 8)
+            max_scroll = max(0.0, content_h - max_drop_h)
+            self.ui_menu_scroll = max(0.0, min(max_scroll, self.ui_menu_scroll + delta))
+            return
 
     def on_update(self, dt):
         now = time.perf_counter()
@@ -6314,10 +7656,13 @@ class RetroWindow(arcade.Window if arcade else object):
         self.fps_n += n
         if now - self.fps_t >= 1.0:
             fps = self.fps_n / (now - self.fps_t)
+            self._last_fps = fps
+            if fps < 59.0:
+                self._lag_frames = getattr(self, "_lag_frames", 0) + 1
             self.set_caption(f"{self.title_base} - {fps:.1f} FPS")
-            if self.use_vsync and not self.turbo and fps < 54.0:
+            if self.use_vsync and not self.turbo and not self._opening and fps < 45.0:
                 self.slow_secs += 1
-                if self.slow_secs >= 3:
+                if self.slow_secs >= 5:
                     self.act_vsync(False, auto=True)
             else:
                 self.slow_secs = 0
@@ -6345,7 +7690,8 @@ class RetroWindow(arcade.Window if arcade else object):
             self.ui_texts[key] = t
         return t
 
-    def ui_tween(self, key, target, dt, duration=0.20, overshoot=False):
+    def ui_tween(self, key, target, dt, duration=0.22, overshoot=False):
+        """Smooth ease-out-cubic (with optional overshoot) for menus."""
         state = self.ui_hover_t.get(key)
         if state is None:
             state = [0.0, 0.0, 0.0, float(target)]
@@ -6355,11 +7701,12 @@ class RetroWindow(arcade.Window if arcade else object):
         elapsed = min(duration, elapsed + max(0.0, dt))
         t = min(1.0, elapsed / max(0.001, duration))
         if overshoot and old_target > start:
-            c1 = 1.70158
-            c3 = c1 + 1.0
+            # Ease-out-back: slight overshoot then settle
+            c1, c3 = 1.4, 2.4
             eased = 1.0 + c3 * ((t - 1.0) ** 3) + c1 * ((t - 1.0) ** 2)
         else:
-            eased = t * t * (3.0 - 2.0 * t)
+            # Ease-out-cubic: fast start, gentle settle
+            eased = 1.0 - (1.0 - t) ** 3
         value = start + (old_target - start) * eased
         self.ui_hover_t[key] = [value, start, elapsed, old_target]
         return value
@@ -6406,7 +7753,7 @@ class RetroWindow(arcade.Window if arcade else object):
         if self.ui_open is not None:
             self._last_open_menu = self.ui_open
         drop_target = 1.0 if self.ui_open is not None else 0.0
-        drop_t = self.ui_tween("dropdown_pop", drop_target, anim_dt, 0.19, overshoot=(drop_target > 0.5))
+        drop_t = self.ui_tween("dropdown_pop", drop_target, anim_dt, 0.26, overshoot=(drop_target > 0.5))
         i = self.ui_open if self.ui_open is not None else getattr(self, "_last_open_menu", None)
         if i is None or drop_t <= 0.01:
             return
@@ -6414,10 +7761,11 @@ class RetroWindow(arcade.Window if arcade else object):
         alpha = max(0.0, min(1.0, drop_t))
         x0 = self.ui_title_x[i][0]
         w = self.ui_drop_w[i]
-        rows, y_end = self.ui_rows(i, wh)
-        full_h = (wh - MENU_H) - y_end
-        cur_y_end = (wh - MENU_H) - full_h * alpha
-        slide_y = (1.0 - alpha) * 10.0
+        rows, vis_bottom, max_scroll = self.ui_rows(i, wh)
+        # Open downward from just under the top menu bar
+        open_h = (wh - MENU_H) - vis_bottom
+        cur_y_end = (wh - MENU_H - 2) - open_h * alpha
+        slide_y = (1.0 - alpha) * 6.0
         scale_w = w * (0.94 + 0.06 * alpha)
 
         self.ui_rect(x0 - 1, cur_y_end - 1, x0 + scale_w + 1, wh - MENU_H,
@@ -6444,16 +7792,34 @@ class RetroWindow(arcade.Window if arcade else object):
                     self.ui_rect(x0 + 2, yb + 3 + slide_y, x0 + 4.5, yt - 3 + slide_y,
                                  (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], amount * alpha))
             cy = (yt + yb) / 2 + amount * 1.5 + slide_y
-            checked = item["check"] is not None and item["check"]()
+            has_check = item.get("check") is not None
+            checked = has_check and item["check"]()
             chk_t = self.ui_tween(("chk", i, row_index), 1.0 if checked else 0.0, anim_dt, 0.16, overshoot=checked)
-            if chk_t > 0.01:
-                r_sz = 4.0 * max(0.0, chk_t)
-                self.ui_rect(x0 + 12 - r_sz, cy - r_sz, x0 + 12 + r_sz, cy + r_sz,
-                             (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], min(1.0, chk_t) * alpha))
+            if has_check:
+                # Always draw the box outline; fill when checked.
+                self.ui_rect(x0 + 7, cy - 5, x0 + 17, cy + 5,
+                             (C_EDGE[0], C_EDGE[1], C_EDGE[2], alpha))
+                if chk_t > 0.01:
+                    r_sz = 3.0 * max(0.0, chk_t)
+                    self.ui_rect(x0 + 12 - r_sz, cy - r_sz, x0 + 12 + r_sz, cy + r_sz,
+                                 (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], min(1.0, chk_t) * alpha))
             if alpha > 0.35:
                 self.ui_put(self.ui_text(item["label"], C_TEXT), x0 + CHECK_W + amount * 3.5, cy)
                 if item["key"]:
                     self.ui_put(self.ui_text(item["key"], C_DIM, anchor_x="right"), x0 + scale_w - PAD_X, cy)
+
+        # Scrollbar when content overflows
+        if max_scroll > 0 and alpha > 0.4:
+            track_top = wh - MENU_H - 4
+            track_bot = cur_y_end + 4
+            track_h = max(1.0, track_top - track_bot)
+            thumb_h = max(12.0, track_h * (track_h / (track_h + max_scroll)))
+            thumb_y = track_top - (self.ui_menu_scroll / max_scroll) * (track_h - thumb_h)
+            sb_x0 = x0 + scale_w - 6
+            self.ui_rect(sb_x0, track_bot, sb_x0 + 3, track_top,
+                         (C_EDGE[0], C_EDGE[1], C_EDGE[2], 0.6 * alpha))
+            self.ui_rect(sb_x0, thumb_y - thumb_h, sb_x0 + 3, thumb_y,
+                         (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], 0.85 * alpha))
 
     def ui_draw_overlays(self, ww, wh):
         now = time.perf_counter()
@@ -6472,22 +7838,30 @@ class RetroWindow(arcade.Window if arcade else object):
             lw = max(self.ui_text(a, C_ACCENT).content_width for a, _ in rows)
             rw = max(self.ui_text(b, C_TEXT).content_width for _, b in rows)
             full_w, rh = lw + rw + 64, 24
-            full_h = rh * len(rows) + 64
+            content_h = rh * len(rows) + 64
+            # Cap modal height to available window so it can scroll on small scales
+            max_h = max(120, (wh - MENU_H) - 40)
             scale_t = 0.82 + 0.18 * pop_t
-            w, h = full_w * scale_t, full_h * scale_t
-            cx, cy_mid = ww / 2, (wh - MENU_H) / 2 - (1.0 - alpha) * 20.0
+            w = full_w * scale_t
+            h = min(content_h, max_h) * scale_t
+            off = getattr(self, "_overlay_off", [0.0, 0.0])
+            cx = ww / 2 + off[0]
+            cy_mid = (wh - MENU_H) / 2 - (1.0 - alpha) * 20.0 + off[1]
             x0, y1 = cx - w / 2, cy_mid + h / 2
+            y0 = y1 - h
+            self._overlay_bounds = (x0, y0, x0 + w, y1)
 
-            self.ui_rect(x0 - 1, y1 - h - 1, x0 + w + 1, y1 + 1,
+            self.ui_rect(x0 - 1, y0 - 1, x0 + w + 1, y1 + 1,
                          (C_EDGE[0], C_EDGE[1], C_EDGE[2], alpha))
-            self.ui_rect(x0, y1 - h, x0 + w, y1,
+            self.ui_rect(x0, y0, x0 + w, y1,
                          (C_DROP[0], C_DROP[1], C_DROP[2], 0.98 * alpha))
             self.ui_rect(x0, y1 - 2, x0 + w, y1,
                          (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], 0.85 * alpha))
 
             if alpha > 0.35:
                 self.ui_put(self.ui_text(title, C_TEXT, 14), x0 + 24, y1 - 24)
-                bx0, by0, bx1, by1 = x0 + w - 94, y1 - 42, x0 + w - 18, y1 - 14
+                self._overlay_titlebar = (x0, y1 - 48, x0 + w - 100, y1)
+                bx0, by0, bx1, by1 = x0 + w - 86, y1 - 40, x0 + w - 12, y1 - 12
                 self.ui_modal_close = (bx0, by0, bx1, by1)
                 mx, my = self.ui_ptr
                 close_hover = (self.ui_overlay is not None) and (bx0 <= mx <= bx1 and by0 <= my <= by1)
@@ -6499,10 +7873,42 @@ class RetroWindow(arcade.Window if arcade else object):
                              (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], alpha))
                 self.ui_put(self.ui_text("Close", C_TEXT, anchor_x="center"),
                             (bx0 + bx1) / 2, (by0 + by1) / 2 + close_amount * 1.0)
+
+                # Scrollable body
+                body_top = y1 - 56
+                body_bot = y0 + 12
+                body_h = max(1.0, body_top - body_bot)
+                total_rows_h = len(rows) * rh * scale_t
+                max_ov_scroll = max(0.0, total_rows_h - body_h)
+                self._overlay_max_scroll = max_ov_scroll
+                self.ui_overlay_scroll = max(0.0, min(self.ui_overlay_scroll, max_ov_scroll))
+                self._overlay_row_hits = []
                 for n, (a, b) in enumerate(rows):
-                    y = y1 - 56 - n * rh * scale_t
-                    self.ui_put(self.ui_text(a, C_ACCENT), x0 + 24, y)
-                    self.ui_put(self.ui_text(b, C_TEXT), x0 + 24 + lw + 16, y)
+                    y = body_top - n * rh * scale_t + self.ui_overlay_scroll
+                    if y < body_bot - 4 or y > body_top + 4:
+                        continue
+                    self._overlay_row_hits.append((x0 + 8, y - 10, x0 + w - 16, y + 10, a, b))
+                    is_toggle = str(b).lower() in ("on", "off", "true", "false", "yes", "no")
+                    if is_toggle:
+                        on = str(b).lower() in ("on", "true", "yes")
+                        self.ui_rect(x0 + 16, y - 6, x0 + 28, y + 6,
+                                     (C_EDGE[0], C_EDGE[1], C_EDGE[2], alpha))
+                        if on:
+                            self.ui_rect(x0 + 18, y - 4, x0 + 26, y + 4,
+                                         (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], alpha))
+                        self.ui_put(self.ui_text(a, C_ACCENT), x0 + 36, y)
+                    else:
+                        self.ui_put(self.ui_text(a, C_ACCENT), x0 + 24, y)
+                        self.ui_put(self.ui_text(b, C_TEXT), x0 + 24 + lw + 16, y)
+                # Overlay scrollbar
+                if max_ov_scroll > 0:
+                    thumb_h = max(12.0, body_h * (body_h / (body_h + max_ov_scroll)))
+                    thumb_y = body_top - (self.ui_overlay_scroll / max_ov_scroll) * (body_h - thumb_h)
+                    sb_x0 = x0 + w - 8
+                    self.ui_rect(sb_x0, body_bot, sb_x0 + 3, body_top,
+                                 (C_EDGE[0], C_EDGE[1], C_EDGE[2], 0.6 * alpha))
+                    self.ui_rect(sb_x0, thumb_y - thumb_h, sb_x0 + 3, thumb_y,
+                                 (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], 0.85 * alpha))
         else:
             self.ui_modal_close = None
 
@@ -6526,6 +7932,28 @@ class RetroWindow(arcade.Window if arcade else object):
                          (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], t_alpha))
             if t_alpha > 0.35:
                 self.ui_put(t, 18, y0 + 11)
+
+    def _draw_hud(self, ww, wh):
+        """Top-right HUD: FPS, frame, lag — matches the MesenCE overlay."""
+        if not getattr(self.settings, "show_fps", True):
+            return
+        fps = getattr(self, "_last_fps", 0.0)
+        frames = getattr(self.console, "frames", 0) if self.console else 0
+        lag = getattr(self, "_lag_frames", 0)
+        lines = []
+        if self.settings.show_fps:
+            lines.append(f"FPS: {fps:5.2f}")
+        if self.settings.show_frame_counter:
+            lines.append(f"Frame: {frames}")
+        if self.settings.show_lag_counter:
+            lines.append(f"Lag: {lag}")
+        if not lines:
+            return
+        y = wh - MENU_H - 14
+        for line in lines:
+            t = self.ui_text(line, (1.0, 1.0, 1.0), 11, anchor_x="right")
+            self.ui_put(t, ww - 8, y)
+            y -= 14
 
     def on_draw(self):
         self.clear()
@@ -6555,9 +7983,10 @@ class RetroWindow(arcade.Window if arcade else object):
                 self.ui_rect(8, 8, 10, 32, C_ACCENT)
                 self.ui_put(tag, 8 + pad + 2, 20)
         else:
-            t = self.ui_text("File > Open ROM... (.nes / .sfc / .snes / .gb / .gbc / .gba)   (Ctrl+O)", C_DIM, 14, "center")
+            t = self.ui_text("File > Open ROM... (NES / Famicom / SNES / N64 / GB / GBC / GBA)   (Ctrl+O)", C_DIM, 14, "center")
             self.ui_put(t, ww / 2, avail / 2)
         self.ui_draw_menu(ww, wh)
+        self._draw_hud(ww, wh)
         self.ui_draw_overlays(ww, wh)
 
     def on_close(self):
@@ -6599,7 +8028,7 @@ def pick_rom():
         "p = filedialog.askopenfilename(\n"
         "    title='Select ROM (.nes, .sfc, .smc, .snes, .gb, .gbc, .gba)',\n"
         "    filetypes=[\n"
-        "        ('All Supported ROMs', '*.nes *.sfc *.smc *.snes *.gb *.gbc *.gba'),\n"
+        "        ('All Supported ROMs', '*.nes *.fds *.fam *.unf *.sfc *.smc *.snes *.z64 *.n64 *.v64 *.gb *.gbc *.gba'),\n        ('Famicom / Disk System', '*.fds *.fam *.unf'),\n        ('Nintendo 64 ROMs', '*.z64 *.n64 *.v64'),\n"
         "        ('NES ROMs', '*.nes'),\n"
         "        ('SNES ROMs', '*.sfc *.smc *.snes'),\n"
         "        ('Game Boy / Color ROMs', '*.gb *.gbc'),\n"
@@ -6653,6 +8082,12 @@ def main():
                 max_catchup=args.max_frameskip, vsync=not args.no_vsync,
                 audio_latency=max(10, min(100, args.audio_latency)) / 1000.0,
                 audio_backend=args.audio_backend)
+    # Optional SDL2/SDL3 path: if settings.video_backend is sdl2/sdl3 and the
+    # module is present, the arcade window above is still used for the UI;
+    # the flag is recorded so a future headless/SDL render loop can take over.
+    if getattr(RetroWindow, "_settings", None) and RetroWindow._settings.video_backend.startswith("sdl"):
+        print(f"[video] SDL backend requested ({RetroWindow._settings.video_backend}); "
+              f"sdl2={_HAS_SDL2} sdl3={_HAS_SDL3}")
     arcade.run()
 
 
