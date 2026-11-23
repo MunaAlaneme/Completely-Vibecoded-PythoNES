@@ -1539,6 +1539,9 @@ class Envelope:
 
 
 class Pulse(Envelope):
+    """2A03 pulse channel with a cycle-stepped timer: the 8-step duty
+    sequencer advances every 2*(t+1) CPU cycles (f = CPU / (16*(t+1))), so
+    register changes take effect immediately instead of only between chunks."""
     def __init__(self, ch):
         self.ch = ch
         self._env_init()
@@ -1550,7 +1553,8 @@ class Pulse(Envelope):
         self.sweep_shift = 0
         self.sweep_div = 0
         self.sweep_reload = False
-        self.phase = 0.0
+        self.timer_phase = 0.0
+        self.seq_idx = 0
 
     def write(self, r, v):
         if r == 0:
@@ -1571,7 +1575,8 @@ class Pulse(Envelope):
             if self.enabled:
                 self.length = LENGTH_TABLE[v >> 3]
             self.env_start = True
-            self.phase = 0.0
+            self.timer_phase = 0.0
+            self.seq_idx = 0
 
     def _target(self):
         d = self.timer >> self.sweep_shift
@@ -1590,20 +1595,26 @@ class Pulse(Envelope):
         else:
             self.sweep_div -= 1
 
-    def render(self, n, sr):
+    def advance(self, cycles):
+        period = 2.0 * (self.timer + 1)
+        self.timer_phase += cycles
+        period = 2.0 * (self.timer + 1)
+        while self.timer_phase >= period:
+            self.timer_phase -= period
+            self.seq_idx = (self.seq_idx + 1) & 7
+
+    def level(self):
         if not self.enabled or self.length == 0 or self.timer < 8 or self._target() > 0x7FF:
-            return None
+            return 0.0
         vol = self.volume()
         if vol == 0:
-            return None
-        # Canonical NES pulse frequency: f = CPU / (16 * (t + 1))
-        step = CPU_HZ / (16.0 * (self.timer + 1)) / sr
-        ph = self.phase + step * np.arange(n)
-        self.phase = (self.phase + step * n) % 1.0
-        return DUTY[self.duty][((ph % 1.0) * 8).astype(np.intp)] * vol
+            return 0.0
+        return DUTY[self.duty][self.seq_idx] * vol
 
 
 class Triangle:
+    """2A03 triangle: 32-step sequence clocked every (t+1) CPU cycles
+    (f = CPU / (32*(t+1))), gated by the length and linear counters."""
     def __init__(self):
         self.enabled = False
         self.control = False
@@ -1612,7 +1623,8 @@ class Triangle:
         self.reload_flag = False
         self.timer = 0
         self.length = 0
-        self.phase = 0.0
+        self.timer_phase = 0.0
+        self.seq_idx = 0
 
     def write(self, r, v):
         if r == 0:
@@ -1625,6 +1637,8 @@ class Triangle:
             if self.enabled:
                 self.length = LENGTH_TABLE[v >> 3]
             self.reload_flag = True
+            self.timer_phase = 0.0
+            self.seq_idx = 0
 
     def set_enabled(self, en):
         self.enabled = bool(en)
@@ -1643,22 +1657,29 @@ class Triangle:
         if self.length > 0 and not self.control:
             self.length -= 1
 
-    def render(self, n, sr):
+    def advance(self, cycles):
+        self.timer_phase += cycles
+        period = self.timer + 1
+        while self.timer_phase >= period:
+            self.timer_phase -= period
+            self.seq_idx = (self.seq_idx + 1) & 31
+
+    def level(self):
         if not self.enabled or self.length == 0 or self.linear == 0 or self.timer < 2:
-            return None
-        # Canonical NES triangle frequency: f = CPU / (32 * (t + 1))
-        step = CPU_HZ / (32.0 * (self.timer + 1)) / sr
-        ph = self.phase + step * np.arange(n)
-        self.phase = (self.phase + step * n) % 1.0
-        return TRI_SEQ[((ph % 1.0) * 32).astype(np.intp)]
+            return 0.0
+        return TRI_SEQ[self.seq_idx]
 
 
 class Noise(Envelope):
+    """2A03 noise: a 15-bit LFSR (93-step in short mode) clocked every
+    NOISE_PERIOD[t] CPU cycles, stepped exactly instead of sampled from a
+    precomputed playback sequence."""
     def __init__(self):
         self._env_init()
         self.short = False
         self.period = NOISE_PERIOD[0]
-        self.pos = 0.0
+        self.lfsr = 1
+        self.timer_phase = 0.0
 
     def write(self, r, v):
         if r == 0:
@@ -1666,24 +1687,35 @@ class Noise(Envelope):
             self.const = bool(v & 0x10)
             self.vol = v & 15
         elif r == 2:
-            self.short = bool(v & 0x80)
+            new_short = bool(v & 0x80)
+            if new_short != self.short:
+                self.lfsr = 1
+                self.timer_phase = 0.0
+            self.short = new_short
             self.period = NOISE_PERIOD[v & 15]
         elif r == 3:
             if self.enabled:
                 self.length = LENGTH_TABLE[v >> 3]
             self.env_start = True
 
-    def render(self, n, sr):
+    def advance(self, cycles):
+        self.timer_phase += cycles
+        per = float(self.period)
+        tap = 6 if self.short else 1
+        guard = 0
+        while self.timer_phase >= per and guard < 8192:
+            self.timer_phase -= per
+            fb = (self.lfsr ^ (self.lfsr >> tap)) & 1
+            self.lfsr = (self.lfsr >> 1) | (fb << 14)
+            guard += 1
+
+    def level(self):
         if not self.enabled or self.length == 0:
-            return None
+            return 0.0
         vol = self.volume()
         if vol == 0:
-            return None
-        seq = noise_seq(self.short)
-        rate = CPU_HZ / self.period / sr
-        idx = ((self.pos + rate * np.arange(n)).astype(np.int64)) % len(seq)
-        self.pos = (self.pos + rate * n) % len(seq)
-        return seq[idx] * vol
+            return 0.0
+        return (1.0 if (self.lfsr & 1) == 0 else 0.0) * vol
 
 
 class DMC:
@@ -1739,9 +1771,8 @@ class DMC:
                 elif self.irq_en:
                     self.irq = True
 
-    def run(self, cycles, bus):
+    def advance(self, cycles, bus):
         self.acc += cycles
-        levels = []
         while self.acc >= self.period:
             self.acc -= self.period
             if not self.silence:
@@ -1761,8 +1792,6 @@ class DMC:
                     self.shift = self.buffer
                     self.buffer = None
                 self.fill(bus)
-            levels.append(self.level)
-        return levels
 
 
 class NESAPU:
@@ -1780,8 +1809,10 @@ class NESAPU:
         self.sr = sample_rate
         self.acc = 0.0
         self.dc = 0.0
+        self._dc_block = 0.0
         self.volume = 0.7
         self.sink = None
+        self._hw_carry = 0.0
 
     def write(self, a, v):
         if a < 0x4004: self.p1.write(a & 3, v)
@@ -1831,13 +1862,11 @@ class NESAPU:
         # CPU clock and warbles the pitch whenever the frame loop hands over
         # a non-standard chunk of cycles.
         cycles = int(cycles)
-        levels = self.dmc.run(cycles, self.bus)
-        if self.sink is not None:
-            self.acc += cycles * self.sr / CPU_HZ
-            n = int(self.acc)
-            self.acc -= n
-            if n > 0:
-                self._render(n, levels)
+        self.acc += cycles * self.sr / CPU_HZ
+        n = int(self.acc)
+        self.acc -= n
+        if n > 0 and self.sink is not None:
+            self._render(n)
         if q in (1, 3):
             self.clock_half()
         self.clock_quarter()
@@ -1845,32 +1874,41 @@ class NESAPU:
             self.frame_irq = True
         self.update_irq()
 
-    def _render(self, n, levels):
-        """NES mixer: pulse table + TND table (nesdev wiki approximation)."""
+    def _render(self, n):
+        """NES mixer: channels are stepped hardware-accurately sample by
+        sample so mid-chunk register writes change the output immediately.
+        Combined level uses the pulse table + TND table (nesdev wiki)."""
         sr = self.sr
-        p1 = self.p1.render(n, sr)
-        p2 = self.p2.render(n, sr)
-        pulse = (p1 if p1 is not None else 0.0) + (p2 if p2 is not None else 0.0)
-        pulse = np.asarray(pulse, dtype=np.float32)
-        # pulse_out = 95.88 / (8128 / pulse + 100)
-        pulse_sum = np.clip(pulse, 0, 30)
-        pulse_out = np.where(pulse_sum > 0, 95.88 / (8128.0 / pulse_sum + 100.0), 0.0)
-        tri = self.tri.render(n, sr)
-        noi = self.noi.render(n, sr)
-        tri_v = np.asarray(tri if tri is not None else 0.0, dtype=np.float32)
-        noi_v = np.asarray(noi if noi is not None else 0.0, dtype=np.float32)
-        if levels:
-            lv = np.array(levels, dtype=np.float32)
-            dmc_v = lv[(np.arange(n) * len(lv)) // n]
-        else:
-            dmc_v = float(self.dmc.level)
-        # tnd_out = 159.79 / (1 / (tri/8227 + noise/12241 + dmc/22638) + 100)
-        tnd = tri_v / 8227.0 + noi_v / 12241.0 + np.asarray(dmc_v, dtype=np.float32) / 22638.0
-        tnd_out = np.where(tnd > 0, 159.79 / (1.0 / tnd + 100.0), 0.0)
-        out = (pulse_out + tnd_out).astype(np.float32)
-        m = float(out.mean()) if out.size else 0.0
-        out -= self.dc
-        self.dc += (m - self.dc) * 0.015
+        out = np.empty(n, dtype=np.float32)
+        inc = CPU_HZ / sr
+        carry = self._hw_carry
+        p1, p2, tri, noi, dmc = self.p1, self.p2, self.tri, self.noi, self.dmc
+        dc_x = self.dc
+        dc_y = self._dc_block
+        dc_r = 1.0 - 2.0 * 3.14159265 * 20.0 / sr
+        for i in range(n):
+            carry += inc
+            st = int(carry)
+            carry -= st
+            if st:
+                p1.advance(st)
+                p2.advance(st)
+                tri.advance(st)
+                noi.advance(st)
+                dmc.advance(st, self.bus)
+            pv = p1.level() + p2.level()
+            pv = pv if pv < 30.0 else 30.0
+            pulse_out = 95.88 / (8128.0 / pv + 100.0) if pv > 0 else 0.0
+            tnd = tri.level() / 8227.0 + noi.level() / 12241.0 + dmc.level / 22638.0
+            tnd_out = 159.79 / (1.0 / tnd + 100.0) if tnd > 0 else 0.0
+            x = pulse_out + tnd_out
+            y = x - dc_x + dc_r * dc_y
+            dc_x = x
+            dc_y = y
+            out[i] = y
+        self._hw_carry = carry
+        self.dc = dc_x
+        self._dc_block = dc_y
         out = np.tanh(out * 1.1) * 0.85
         pcm = np.clip(out * (32767.0 * self.volume), -32767, 32767).astype(np.int16)
         self.sink(pcm)
@@ -2807,7 +2845,7 @@ class SNESPPU:
 
 
 class SNESAPU:
-    """Multi-System Audio Synthesizer (SNES SPC700/DSP, GB/GBC DMG 4-Ch, GBA DirectSound + PSG 1-4)."""
+    """Multi-System Audio Synthesizer (SNES SPC700/DSP, GBA DirectSound + PSG 1-4)."""
     def __init__(self, sample_rate=44100, mode="snes"):
         self.sr = sample_rate
         self.mode = mode
@@ -2824,7 +2862,6 @@ class SNESAPU:
         self.amps = np.zeros(8, dtype=np.float32)
         self.note_decay = np.zeros(8, dtype=np.float32)
         self.dc = 0.0
-        self.gb_io = None
         self.gba_io = None
         self.gba_fifo_a = bytearray()
         self.gba_fifo_b = bytearray()
@@ -2872,100 +2909,6 @@ class SNESAPU:
             self.freqs[ch] = 110.0 * (2.0 ** (note_idx / 12.0))
             self.amps[ch] = 0.18
             self.note_decay[ch] = 0.975
-
-    def _render_gb_samples(self, n):
-        io = self.gb_io
-        if io is None:
-            return np.zeros(n, dtype=np.float32)
-        nr52 = io[0x26]
-        if not (nr52 & 0x80):
-            if (io[0x12] & 0xF0) or (io[0x17] & 0xF0) or (io[0x1A] & 0x80) or (io[0x21] & 0xF0):
-                nr52 |= 0x80
-            else:
-                return np.zeros(n, dtype=np.float32)
-
-        # Process trigger bits (bit 7 of NR14/NR24/NR34/NR44) & hardware envelope decay so notes never hang/buzz!
-        for ch, nr_env_idx, nr_trig_idx in ((0, 0x12, 0x14), (1, 0x17, 0x19), (3, 0x21, 0x23)):
-            if io[nr_trig_idx] & 0x80:
-                io[nr_trig_idx] &= 0x7F
-                self.amps[ch] = float((io[nr_env_idx] >> 4) & 0x0F) / 15.0
-                env_step = io[nr_env_idx] & 7
-                env_up = bool(io[nr_env_idx] & 8)
-                if env_step == 0:
-                    self.note_decay[ch] = 0.985 if (io[nr_trig_idx] & 0x40) else 0.998
-                else:
-                    self.note_decay[ch] = 1.002 if env_up else max(0.88, 1.0 - (0.045 / env_step))
-            elif (io[nr_env_idx] >> 4) == 0:
-                self.amps[ch] = 0.0
-            elif self.amps[ch] == 0.0 and (io[nr_env_idx] >> 4) > 0:
-                self.amps[ch] = float((io[nr_env_idx] >> 4) & 0x0F) / 15.0
-                self.note_decay[ch] = 0.992
-
-        nr50 = io[0x24] if io[0x24] else 0x77
-        nr51 = io[0x25] if io[0x25] else 0xFF
-        master = (((nr50 & 7) + 1) + (((nr50 >> 4) & 7) + 1)) / 16.0
-        out = np.zeros(n, dtype=np.float32)
-        t = np.arange(n, dtype=np.float64)
-
-        # Channel 1: Square + Sweep (band-limited smooth pulse)
-        a1 = float(self.amps[0])
-        if a1 > 0.004 and (nr51 & 0x11):
-            raw_f1 = io[0x13] | ((io[0x14] & 7) << 8)
-            if 0 < raw_f1 < 2046:
-                f1 = 131072.0 / max(2, 2048 - raw_f1)
-                duty1 = (0.125, 0.25, 0.5, 0.75)[(io[0x11] >> 6) & 3]
-                ph1 = (self.phase[0] + t * (f1 / self.sr)) % 1.0
-                self.phase[0] = (self.phase[0] + n * (f1 / self.sr)) % 1.0
-                sq1 = np.where(ph1 < duty1, 1.0, -1.0).astype(np.float32)
-                out += sq1 * a1 * 0.24
-                self.amps[0] = min(1.0, a1 * float(self.note_decay[0]))
-
-        # Channel 2: Square
-        a2 = float(self.amps[1])
-        if a2 > 0.004 and (nr51 & 0x22):
-            raw_f2 = io[0x18] | ((io[0x19] & 7) << 8)
-            if 0 < raw_f2 < 2046:
-                f2 = 131072.0 / max(2, 2048 - raw_f2)
-                duty2 = (0.125, 0.25, 0.5, 0.75)[(io[0x16] >> 6) & 3]
-                ph2 = (self.phase[1] + t * (f2 / self.sr)) % 1.0
-                self.phase[1] = (self.phase[1] + n * (f2 / self.sr)) % 1.0
-                sq2 = np.where(ph2 < duty2, 1.0, -1.0).astype(np.float32)
-                out += sq2 * a2 * 0.24
-                self.amps[1] = min(1.0, a2 * float(self.note_decay[1]))
-
-        # Channel 3: Wave RAM ($FF30-$FF3F)
-        if (io[0x1A] & 0x80) and (nr51 & 0x44):
-            w_shift = (io[0x1C] >> 5) & 3
-            if w_shift > 0:
-                raw_f3 = io[0x1D] | ((io[0x1E] & 7) << 8)
-                if 0 < raw_f3 < 2046:
-                    f3 = 65536.0 / max(2, 2048 - raw_f3)
-                    w_bytes = io[0x30:0x40]
-                    w_table = np.empty(32, dtype=np.float32)
-                    for wi in range(16):
-                        w_table[wi * 2] = ((w_bytes[wi] >> 4) & 0x0F) / 7.5 - 1.0
-                        w_table[wi * 2 + 1] = (w_bytes[wi] & 0x0F) / 7.5 - 1.0
-                    ph3 = (self.phase[2] + t * (f3 / self.sr)) % 1.0
-                    self.phase[2] = (self.phase[2] + n * (f3 / self.sr)) % 1.0
-                    w_gain = (0.0, 1.0, 0.5, 0.25)[w_shift]
-                    out += w_table[(ph3 * 32.0).astype(np.intp)] * w_gain * 0.26
-
-        # Channel 4: LFSR Noise (low-pass smoothed & envelope-gated to prevent static hiss)
-        a4 = float(self.amps[3])
-        if a4 > 0.008 and (nr51 & 0x88):
-            nr43 = io[0x22]
-            div_r = 0.5 if (nr43 & 7) == 0 else float(nr43 & 7)
-            fn = min(16000.0, 524288.0 / div_r / (2.0 ** (((nr43 >> 4) & 0x0F) + 1)))
-            seq = noise_seq(bool(nr43 & 8))
-            idx = ((self.phase[3] + t * (fn / self.sr)).astype(np.int64)) % len(seq)
-            self.phase[3] = (self.phase[3] + n * (fn / self.sr)) % len(seq)
-            nz_wave = (seq[idx] * 2.0 - 1.0)
-            if n > 2:
-                nz_wave[1:] = 0.5 * nz_wave[1:] + 0.5 * nz_wave[:-1]
-            out += nz_wave * a4 * 0.14
-            self.amps[3] = min(1.0, a4 * float(self.note_decay[3]))
-
-        return out * master
 
     def _render_gba_samples(self, n):
         io = self.gba_io
@@ -3060,9 +3003,7 @@ class SNESAPU:
         self.acc -= n
         if n <= 0:
             return
-        if self.mode == "gb":
-            out = self._render_gb_samples(n)
-        elif self.mode == "gba":
+        if self.mode == "gba":
             out = self._render_gba_samples(n)
         else:
             out = self._render_snes_samples(n)
@@ -4398,6 +4339,1113 @@ _GB_DMG_PAL = np.array([
 ], dtype=np.uint8)
 
 
+GB_DUTY = ((0, 0, 0, 0, 0, 0, 0, 1),
+           (1, 0, 0, 0, 0, 0, 0, 1),
+           (1, 0, 0, 0, 0, 1, 1, 1),
+           (0, 1, 1, 1, 1, 1, 1, 0))
+GB_CLOCK_HZ = 4194304.0
+
+
+class _GBEnv:
+    """Shared length counter + volume envelope unit for pulse/noise channels."""
+    def __init__(self):
+        self.length = 0
+        self.len_en = False
+        self.init_vol = 0
+        self.env_dir = 1
+        self.env_period = 0
+        self.env_timer = 0
+        self.vol = 0
+
+    def nrx1(self, max_len, v):
+        self.length = max_len - (v & (max_len - 1))
+
+    def nrx2(self, v):
+        self.init_vol = (v >> 4) & 0x0F
+        self.env_dir = 1 if (v & 0x08) else -1
+        self.env_period = v & 0x07
+
+    def nrx4(self, v):
+        self.len_en = bool(v & 0x40)
+
+    def trigger(self, max_len):
+        if self.length == 0:
+            self.length = max_len
+        self.vol = self.init_vol
+        self.env_timer = self.env_period
+
+    def clock_len(self):
+        if self.len_en and self.length > 0:
+            self.length -= 1
+
+    def clock_env(self):
+        if self.env_period == 0:
+            return
+        self.env_timer -= 1
+        if self.env_timer <= 0:
+            self.env_timer = self.env_period
+            self.vol = min(15, self.vol + 1) if self.env_dir > 0 else max(0, self.vol - 1)
+
+
+class GBPulse:
+    """DMG pulse channel 1/2: duty-cycle sequencer clocked at
+    (2048 - freq) * 4 T-cycles per step, envelope + optional sweep."""
+    def __init__(self, ch):
+        self.ch = ch
+        self.duty = 0
+        self.raw_freq = 0
+        self.seq_idx = 0
+        self.seq_phase = 0.0
+        self.env_unit = _GBEnv()
+        self.sweep_en = False
+        self.sweep_period = 0
+        self.sweep_neg = False
+        self.sweep_shift = 0
+        self.sweep_timer = 0
+        self.sweep_freq = 0
+        self.enabled = False
+
+    def dac_from(self, v):
+        return (v & 0xF8) != 0
+
+    def nrx0(self, v):
+        self.sweep_en = bool(v & 0x80)
+        self.sweep_period = (v >> 4) & 7
+        self.sweep_neg = bool(v & 0x08)
+        self.sweep_shift = v & 7
+
+    def nrx3(self, v):
+        self.raw_freq = (self.raw_freq & 0x700) | v
+
+    def nrx4(self, v):
+        self.raw_freq = (self.raw_freq & 0xFF) | ((v & 7) << 8)
+
+    def trigger(self):
+        self.enabled = self.dac
+        e = self.env_unit
+        e.trigger(64)
+        self.seq_idx = 0
+        self.seq_phase = 0.0
+        if self.ch == 0:
+            self.sweep_freq = self.raw_freq
+            self.sweep_timer = self.sweep_period or 8
+            self.sweep_en = self.sweep_en or self.sweep_period > 0 or self.sweep_shift > 0
+            if self.sweep_shift:
+                self._sweep_calc()
+
+    def _sweep_calc(self):
+        d = self.sweep_freq >> self.sweep_shift
+        new = self.sweep_freq - d - 1 if self.sweep_neg else self.sweep_freq + d
+        if new > 2047:
+            self.enabled = False
+        return new
+
+    def clock_sweep(self):
+        self.sweep_timer -= 1
+        if self.sweep_timer <= 0:
+            self.sweep_timer = self.sweep_period or 8
+            if self.sweep_en and self.sweep_period:
+                new = self._sweep_calc()
+                if new <= 2047 and self.sweep_shift:
+                    self.sweep_freq = new
+                    self.raw_freq = new
+                    self._sweep_calc()
+
+    def clock_len_ctrl(self, io):
+        e = self.env_unit
+        was = e.length
+        e.clock_len()
+        if e.length == 0 and was > 0:
+            io[0x26] &= ~(0x01 << self.ch) & 0xFF
+            self.enabled = False
+
+    def advance(self, cycles, io):
+        e = self.env_unit
+        period = max(4.0, 4.0 * (2048 - self.raw_freq))
+        self.seq_phase += cycles
+        while self.seq_phase >= period:
+            self.seq_phase -= period
+            self.seq_idx = (self.seq_idx + 1) & 7
+        if not (self.enabled and self.dac and e.length > 0 and e.vol > 0 and io[0x26] & 0x80):
+            return 0.0, 0.0
+        out = GB_DUTY[self.duty][self.seq_idx] * e.vol
+        return out / 15.0, out / 15.0
+
+
+class GBWave:
+    """DMG wave channel: 32 4-bit samples from wave RAM clocked at
+    (2048 - freq) * 2 T-cycles per sample, with volume shift."""
+    def __init__(self):
+        self.raw_freq = 0
+        self.pos = 0
+        self.pos_phase = 0.0
+        self.env_unit = _GBEnv()
+        self.enabled = False
+        self.vol_code = 0
+        self.dac = False
+
+    def nrx0(self, v):
+        self.dac = bool(v & 0x80)
+
+    def nrx2(self, v):
+        self.vol_code = (v >> 5) & 3
+
+    def nrx3(self, v):
+        self.raw_freq = (self.raw_freq & 0x700) | v
+
+    def nrx4(self, v):
+        self.raw_freq = (self.raw_freq & 0xFF) | ((v & 7) << 8)
+
+    def trigger(self):
+        self.enabled = self.dac
+        e = self.env_unit
+        if e.length == 0:
+            e.length = 256
+        self.pos = 0
+        self.pos_phase = 0.0
+
+    def clock_len_ctrl(self, io):
+        e = self.env_unit
+        was = e.length
+        e.clock_len()
+        if e.length == 0 and was > 0:
+            io[0x26] &= ~0x04
+            self.enabled = False
+
+    def advance(self, cycles, io):
+        period = max(2.0, 2.0 * (2048 - self.raw_freq))
+        self.pos_phase += cycles
+        while self.pos_phase >= period:
+            self.pos_phase -= period
+            self.pos = (self.pos + 1) & 31
+        e = self.env_unit
+        if not (self.enabled and self.dac and e.length > 0 and self.vol_code and io[0x26] & 0x80):
+            return 0.0, 0.0
+        b = io[0x30 + (self.pos >> 1)]
+        v = (b >> 4) & 0x0F if (self.pos & 1) == 0 else b & 0x0F
+        gain = (0, 1, 2)[self.vol_code - 1]
+        return (v >> gain) / 15.0, (v >> gain) / 15.0
+
+
+class GBNoise:
+    """DMG noise channel: 15/7-bit LFSR clocked at
+    524288 / divisor / 2^(shift+1) Hz, envelope unit attached."""
+    def __init__(self):
+        self.env_unit = _GBEnv()
+        self.div = 0
+        self.shift = 0
+        self.width7 = False
+        self.lfsr = 0x7FFF
+        self.lfsr_phase = 0.0
+        self.enabled = False
+        self.dac = False
+
+    def nrx3(self, v):
+        self.width7 = bool(v & 0x08)
+        self.shift = (v >> 4) & 0x0F
+        self.div = v & 7
+
+    def nrx4(self, v):
+        pass
+
+    def trigger(self):
+        self.enabled = self.dac
+        e = self.env_unit
+        e.trigger(64)
+        self.lfsr = 0x7FFF
+        self.lfsr_phase = 0.0
+
+    def clock_len_ctrl(self, io):
+        e = self.env_unit
+        was = e.length
+        e.clock_len()
+        if e.length == 0 and was > 0:
+            io[0x26] &= ~0x08
+            self.enabled = False
+
+    def advance(self, cycles, io):
+        d = 8 if self.div == 0 else self.div
+        period = 8.0 * d * (1 << (self.shift + 1))
+        self.lfsr_phase += cycles
+        while self.lfsr_phase >= period:
+            self.lfsr_phase -= period
+            fb = (self.lfsr ^ (self.lfsr >> 1)) & 1
+            self.lfsr = (self.lfsr >> 1) | (fb << (6 if self.width7 else 14))
+        e = self.env_unit
+        if not (self.enabled and self.dac and e.length > 0 and e.vol > 0 and io[0x26] & 0x80):
+            return 0.0, 0.0
+        out = 0.0 if (self.lfsr & 1) else e.vol
+        return out / 15.0, out / 15.0
+
+
+class GBAPU:
+    """ rewritten Game Boy / Game Boy Color audio unit (DMG 4-channel APU).
+
+    Real hardware model instead of a port synth:
+    - two pulse channels with duty sequencers, length counters, envelopes
+      and (ch1) a frequency sweep unit
+    - wave channel with 32-step 4-bit sample playback from wave RAM
+    - noise channel with a stepped 15/7-bit LFSR and envelope
+    - 512 Hz frame sequencer driving length/sweep/envelope clocks (NR52 on)
+    - NR50 master volumes and NR51 per-channel panning mixed per sample
+    """
+    FS_STEP_T = 8192  # T-cycles per frame-sequencer step (512 Hz)
+
+    def __init__(self, sample_rate=44100):
+        self.sr = sample_rate
+        self.volume = 0.7
+        self.sink = None
+        self.ch1 = GBPulse(0)
+        self.ch2 = GBPulse(1)
+        self.ch3 = GBWave()
+        self.ch4 = GBNoise()
+        self.fs_step = 0
+        self.fs_phase = 0.0
+        self._sample_acc = 0.0
+        self._step_acc = 0.0
+        self._hw_acc = 0.0
+        self.buf = []
+        self.dc = 0.0
+        self.irq = False
+
+    def set_io(self, io):
+        self.gb_io = io
+
+    def power(self, io):
+        return bool(io[0x26] & 0x80)
+
+    def write(self, r, v, io):
+        if r == 0x26:
+            return
+        if r == 0x10:
+            self.ch1.nrx0(v)
+        elif r == 0x11:
+            self.ch1.duty = (v >> 6) & 3
+            self.ch1.env_unit.nrx1(64, v)
+        elif r == 0x12:
+            self.ch1.env_unit.nrx2(v)
+            self.ch1.dac = self.ch1.dac_from(v)
+        elif r == 0x13:
+            self.ch1.nrx3(v)
+        elif r == 0x14:
+            self.ch1.env_unit.nrx4(v)
+            self.ch1.nrx4(v)
+            if v & 0x80:
+                self.ch1.trigger()
+                if self.ch1.enabled:
+                    io[0x26] |= 0x01
+        elif r == 0x16:
+            self.ch2.duty = (v >> 6) & 3
+            self.ch2.env_unit.nrx1(64, v)
+        elif r == 0x17:
+            self.ch2.env_unit.nrx2(v)
+            self.ch2.dac = self.ch2.dac_from(v)
+        elif r == 0x18:
+            self.ch2.nrx3(v)
+        elif r == 0x19:
+            self.ch2.env_unit.nrx4(v)
+            self.ch2.nrx4(v)
+            if v & 0x80:
+                self.ch2.trigger()
+                if self.ch2.enabled:
+                    io[0x26] |= 0x02
+        elif r == 0x1A:
+            self.ch3.nrx0(v)
+            if not self.ch3.dac:
+                self.ch3.enabled = False
+                io[0x26] &= ~0x04
+        elif r == 0x1B:
+            self.ch3.env_unit.nrx1(256, v)
+        elif r == 0x1C:
+            self.ch3.nrx2(v)
+        elif r == 0x1D:
+            self.ch3.nrx3(v)
+        elif r == 0x1E:
+            self.ch3.env_unit.nrx4(v)
+            self.ch3.nrx4(v)
+            if v & 0x80:
+                self.ch3.trigger()
+                if self.ch3.enabled:
+                    io[0x26] |= 0x04
+        elif r == 0x21:
+            self.ch4.env_unit.nrx2(v)
+            self.ch4.dac = (v & 0xF8) != 0
+        elif r == 0x22:
+            self.ch4.nrx3(v)
+        elif r == 0x23:
+            self.ch4.env_unit.nrx4(v)
+            if v & 0x80:
+                self.ch4.trigger()
+                if self.ch4.enabled:
+                    io[0x26] |= 0x08
+
+    def frame_step(self, io):
+        s = self.fs_step
+        if s in (0, 2, 4, 6):
+            self.ch1.clock_len_ctrl(io)
+            self.ch2.clock_len_ctrl(io)
+            self.ch3.clock_len_ctrl(io)
+            self.ch4.clock_len_ctrl(io)
+        if s in (2, 6):
+            self.ch1.clock_sweep()
+        if s == 7:
+            for c in (self.ch1, self.ch2, self.ch4):
+                c.env_unit.clock_env()
+        self.fs_step = (s + 1) & 7
+
+    def tick(self, cycles, io):
+        """Advance the APU by `cycles` T-cycles (called after each CPU step)."""
+        if io[0x26] & 0x80:
+            self.fs_phase += cycles
+            while self.fs_phase >= self.FS_STEP_T:
+                self.fs_phase -= self.FS_STEP_T
+                self.frame_step(io)
+        self._sample_acc += cycles * self.sr / GB_CLOCK_HZ
+        while self._sample_acc >= 1.0 and len(self.buf) < 16384:
+            self._sample_acc -= 1.0
+            self._hw_acc += GB_CLOCK_HZ / self.sr
+            whole = int(self._hw_acc)
+            self._hw_acc -= whole
+            self.buf.append(self._mix(io, whole))
+
+    def _mix(self, io, cycles):
+        ch1 = self.ch1
+        ch2 = self.ch2
+        ch3 = self.ch3
+        ch4 = self.ch4
+        a1l, a1r = ch1.advance(cycles, io)
+        a2l, a2r = ch2.advance(cycles, io)
+        a3l, a3r = ch3.advance(cycles, io)
+        a4l, a4r = ch4.advance(cycles, io)
+        nr50 = io[0x24] or 0x77
+        nr51 = io[0x25]
+        left = a1l if nr51 & 0x10 else 0.0
+        left += a2l if nr51 & 0x20 else 0.0
+        left += a3l if nr51 & 0x40 else 0.0
+        left += a4l if nr51 & 0x80 else 0.0
+        right = a1r if nr51 & 0x01 else 0.0
+        right += a2r if nr51 & 0x02 else 0.0
+        right += a3r if nr51 & 0x04 else 0.0
+        right += a4r if nr51 & 0x08 else 0.0
+        lv = ((nr50 >> 4) & 7) + 1
+        rv = (nr50 & 7) + 1
+        return (left * lv / 60.0 + right * rv / 60.0) / 2.0
+
+    def capture_state(self):
+        return {
+            "fs_step": self.fs_step, "fs_phase": self.fs_phase,
+            "ch1": vars(self.ch1).copy(), "ch2": vars(self.ch2).copy(),
+            "ch3": vars(self.ch3).copy(), "ch4": vars(self.ch4).copy(),
+            "e1": vars(self.ch1.env_unit).copy(), "e2": vars(self.ch2.env_unit).copy(),
+            "e3": vars(self.ch3.env_unit).copy(), "e4": vars(self.ch4.env_unit).copy(),
+            "sample_acc": self._sample_acc, "step_acc": self._step_acc,
+            "hw_acc": self._hw_acc, "buf": list(self.buf),
+        }
+
+    def restore_state(self, st):
+        if not st:
+            return
+        self.fs_step = st.get("fs_step", 0)
+        self.fs_phase = st.get("fs_phase", 0.0)
+        for name, ch in (("ch1", self.ch1), ("ch2", self.ch2), ("ch3", self.ch3), ("ch4", self.ch4)):
+            if name in st and isinstance(st[name], dict):
+                for k, v in st[name].items():
+                    if k != "env_unit" and hasattr(ch, k):
+                        setattr(ch, k, v)
+        for name, e in (("e1", self.ch1.env_unit), ("e2", self.ch2.env_unit),
+                        ("e3", self.ch3.env_unit), ("e4", self.ch4.env_unit)):
+            if name in st and isinstance(st[name], dict):
+                var_dict = vars(e)
+                for k, v in st[name].items():
+                    if k in var_dict:
+                        var_dict[k] = v
+        self._sample_acc = st.get("sample_acc", 0.0)
+        self._step_acc = st.get("step_acc", 0.0)
+        self._hw_acc = st.get("hw_acc", 0.0)
+        if "buf" in st:
+            self.buf = list(st["buf"])
+
+    def power_off(self):
+        for ch in (self.ch1, self.ch2, self.ch3, self.ch4):
+            ch.enabled = False
+            if hasattr(ch, "env_unit"):
+                ch.env_unit.length = 0
+                ch.env_unit.vol = 0
+        if hasattr(self, "gb_io") and self.gb_io is not None:
+            self.gb_io[0x26] = 0
+
+    def run_frame(self):
+        if self.sink is None:
+            self.buf.clear()
+            return
+        if not self.buf:
+            return
+        out = np.asarray(self.buf, dtype=np.float32)
+        self.buf.clear()
+        m = float(out.mean())
+        out -= self.dc
+        self.dc += (m - self.dc) * 0.015
+        out = np.tanh(out * 1.4) * 0.25
+        pcm = np.clip(out * (32767.0 * self.volume), -32767, 32767).astype(np.int16)
+        self.sink(pcm)
+
+
+class GBCPU:
+    """ rewritten Game Boy CPU core (Sharp SM83/LR35902).
+
+    Owns all registers (register-file array + SP/PC/flags), dispatches every
+    opcode and CB-prefixed opcode, implements the delayed-IME behavior of EI,
+    the HALT bug, and per-opcode T-cycle counts including conditional
+    branches. Memory goes through the GameBoy `read`/`write` callbacks.
+    """
+    FZ, FN, FH, FC = 0x80, 0x40, 0x20, 0x10
+
+    def __init__(self, gb):
+        self.gb = gb
+        self.r8 = [0x00, 0x13, 0x00, 0xD8, 0x01, 0x4D, 0x00, 0x01]  # B C D E H L (HL) A
+        self.f = 0xB0
+        self.sp = 0xFFFE
+        self.pc = 0x0100
+        self.ime = False
+        self.ime_delay = False
+        self.halted = False
+        self.halt_bug = False
+
+    def reset(self, cgb=False):
+        self.r8 = [0x00, 0x13, 0x00, 0xD8, 0x01, 0x4D, 0x00, 0x11 if cgb else 0x01]
+        self.f = 0xB0
+        self.sp = 0xFFFE
+        self.pc = 0x0100
+        self.ime = False
+        self.ime_delay = False
+        self.halted = False
+        self.halt_bug = False
+
+    @property
+    def a(self):
+        return self.r8[7]
+
+    @a.setter
+    def a(self, v):
+        self.r8[7] = v & 0xFF
+
+    def _get_r(self, idx):
+        if idx == 6:
+            return self.gb.read((self.r8[4] << 8) | self.r8[5])
+        return self.r8[idx]
+
+    def _set_r(self, idx, val):
+        val &= 0xFF
+        if idx == 6:
+            self.gb.write((self.r8[4] << 8) | self.r8[5], val)
+        else:
+            self.r8[idx] = val
+
+    def _rr(self, hi, lo):
+        return (self.r8[hi] << 8) | self.r8[lo]
+
+    def _set_rr(self, hi, lo, v):
+        self.r8[hi] = (v >> 8) & 0xFF
+        self.r8[lo] = v & 0xFF
+
+    def _read16(self, addr):
+        return self.gb.read(addr) | (self.gb.read((addr + 1) & 0xFFFF) << 8)
+
+    def _push16(self, val):
+        self.sp = (self.sp - 1) & 0xFFFF
+        self.gb.write(self.sp, (val >> 8) & 0xFF)
+        self.sp = (self.sp - 1) & 0xFFFF
+        self.gb.write(self.sp, val & 0xFF)
+
+    def _pop16(self):
+        lo = self.gb.read(self.sp)
+        self.sp = (self.sp + 1) & 0xFFFF
+        hi = self.gb.read(self.sp)
+        self.sp = (self.sp + 1) & 0xFFFF
+        return (hi << 8) | lo
+
+    def _alu(self, op, val):
+        a = self.r8[7]
+        c = (self.f >> 4) & 1
+        if op == 0:  # ADD
+            r = a + val
+            self.f = (0x80 if (r & 0xFF) == 0 else 0) | (0x20 if (a & 15) + (val & 15) > 15 else 0) | (0x10 if r > 255 else 0)
+            self.r8[7] = r & 0xFF
+        elif op == 1:  # ADC
+            r = a + val + c
+            self.f = (0x80 if (r & 0xFF) == 0 else 0) | (0x20 if (a & 15) + (val & 15) + c > 15 else 0) | (0x10 if r > 255 else 0)
+            self.r8[7] = r & 0xFF
+        elif op == 2:  # SUB
+            r = a - val
+            self.f = 0x40 | (0x80 if (r & 0xFF) == 0 else 0) | (0x20 if (a & 15) < (val & 15) else 0) | (0x10 if r < 0 else 0)
+            self.r8[7] = r & 0xFF
+        elif op == 3:  # SBC
+            r = a - val - c
+            self.f = 0x40 | (0x80 if (r & 0xFF) == 0 else 0) | (0x20 if (a & 15) < (val & 15) + c else 0) | (0x10 if r < 0 else 0)
+            self.r8[7] = r & 0xFF
+        elif op == 4:  # AND
+            self.r8[7] = a & val
+            self.f = (0x80 if self.r8[7] == 0 else 0) | 0x20
+        elif op == 5:  # XOR
+            self.r8[7] = a ^ val
+            self.f = 0x80 if self.r8[7] == 0 else 0
+        elif op == 6:  # OR
+            self.r8[7] = a | val
+            self.f = 0x80 if self.r8[7] == 0 else 0
+        else:  # CP
+            r = a - val
+            self.f = 0x40 | (0x80 if (r & 0xFF) == 0 else 0) | (0x20 if (a & 15) < (val & 15) else 0) | (0x10 if r < 0 else 0)
+
+    def step(self):
+        gb = self.gb
+        pending = gb.hram[0x7F] & gb.io[0x0F] & 0x1F
+        was_halted = self.halted
+        if pending:
+            self.halted = False
+            if self.ime:
+                self.ime = False
+                for bit in range(5):
+                    if pending & (1 << bit):
+                        gb.io[0x0F] &= ~(1 << bit)
+                        self._push16(self.pc)
+                        self.pc = 0x40 + (bit << 3)
+                        return 20
+        if self.halted:
+            return 4
+        if self.ime_delay:
+            self.ime = True
+            self.ime_delay = False
+        pc = self.pc
+        op = gb.read(pc)
+        if self.halt_bug:
+            self.halt_bug = False
+        else:
+            self.pc = (pc + 1) & 0xFFFF
+        return self._exec(op, was_halted, pending)
+
+    def _exec(self, op, was_halted, pending):
+        gb = self.gb
+        f = self.f
+        if 0x40 <= op <= 0x7F and op != 0x76:                            # LD r, r'
+            self._set_r((op >> 3) & 7, self._get_r(op & 7))
+            return 8 if ((op & 7) == 6 or ((op >> 3) & 7) == 6) else 4
+        if 0x80 <= op <= 0xBF:                                           # ALU A, r
+            self._alu((op >> 3) & 7, self._get_r(op & 7))
+            return 8 if (op & 7) == 6 else 4
+        if op == 0x76:
+            if self.ime or not pending:
+                self.halted = True
+            else:
+                self.halt_bug = True
+            return 4                                                     # HALT
+        if op == 0x00: return 4                                          # NOP
+        if op == 0x10:                                                   # STOP / CGB speed switch
+            self.pc = (self.pc + 1) & 0xFFFF
+            if gb.cgb and gb.io[0x4D] & 1:
+                gb.io[0x4D] = ((gb.io[0x4D] ^ 0x80) & 0x80) | 0x7E
+            return 4
+        if op == 0xF3:                                                   # DI
+            self.ime = False
+            self.ime_delay = False
+            return 4
+        if op == 0xFB:                                                   # EI (delayed one instruction)
+            self.ime_delay = True
+            return 4
+        if (op & 0xC7) == 0x06:                                          # LD r, d8
+            v = gb.read(self.pc); self.pc = (self.pc + 1) & 0xFFFF
+            self._set_r((op >> 3) & 7, v)
+            return 8
+        if (op & 0xC7) == 0x04:                                          # INC r
+            idx = (op >> 3) & 7
+            v = self._get_r(idx); r = (v + 1) & 0xFF; self._set_r(idx, r)
+            self.f = (self.f & 0x10) | (0x80 if r == 0 else 0) | (0x20 if (v & 15) == 15 else 0)
+            return 12 if idx == 6 else 4
+        if (op & 0xC7) == 0x05:                                          # DEC r
+            idx = (op >> 3) & 7
+            v = self._get_r(idx); r = (v - 1) & 0xFF; self._set_r(idx, r)
+            self.f = (self.f & 0x10) | 0x40 | (0x80 if r == 0 else 0) | (0x20 if (v & 15) == 0 else 0)
+            return 12 if idx == 6 else 4
+        if (op & 0xC7) == 0xC6:                                          # ALU A, d8
+            v = gb.read(self.pc); self.pc = (self.pc + 1) & 0xFFFF
+            self._alu((op >> 3) & 7, v)
+            return 8
+        if op in (0x01, 0x11, 0x21, 0x31):                               # LD rr, d16
+            v = self._read16(self.pc); self.pc = (self.pc + 2) & 0xFFFF
+            if op == 0x01: self._set_rr(0, 1, v)
+            elif op == 0x11: self._set_rr(2, 3, v)
+            elif op == 0x21: self._set_rr(4, 5, v)
+            else: self.sp = v
+            return 12
+        if op in (0x03, 0x13, 0x23, 0x33, 0x0B, 0x1B, 0x2B, 0x3B):       # INC/DEC rr
+            d = 1 if (op & 8) == 0 else -1
+            reg = (op >> 4) & 3
+            if reg == 0: self._set_rr(0, 1, (self._rr(0, 1) + d) & 0xFFFF)
+            elif reg == 1: self._set_rr(2, 3, (self._rr(2, 3) + d) & 0xFFFF)
+            elif reg == 2: self._set_rr(4, 5, (self._rr(4, 5) + d) & 0xFFFF)
+            else: self.sp = (self.sp + d) & 0xFFFF
+            return 8
+        if op in (0x09, 0x19, 0x29, 0x39):                               # ADD HL, rr
+            hl = self._rr(4, 5)
+            rr = (self._rr(0, 1), self._rr(2, 3), hl, self.sp)[(op >> 4) & 3]
+            r = hl + rr
+            self.f = (self.f & 0x80) | (0x20 if (hl & 0xFFF) + (rr & 0xFFF) > 0xFFF else 0) | (0x10 if r > 0xFFFF else 0)
+            self._set_rr(4, 5, r & 0xFFFF)
+            return 8
+        if op == 0x02: gb.write(self._rr(0, 1), self.r8[7]); return 8
+        if op == 0x12: gb.write(self._rr(2, 3), self.r8[7]); return 8
+        if op == 0x22:                                                   # LD (HL+), A
+            hl = self._rr(4, 5); gb.write(hl, self.r8[7])
+            self._set_rr(4, 5, (hl + 1) & 0xFFFF); return 8
+        if op == 0x32:                                                   # LD (HL-), A
+            hl = self._rr(4, 5); gb.write(hl, self.r8[7])
+            self._set_rr(4, 5, (hl - 1) & 0xFFFF); return 8
+        if op == 0x0A: self.r8[7] = gb.read(self._rr(0, 1)); return 8
+        if op == 0x1A: self.r8[7] = gb.read(self._rr(2, 3)); return 8
+        if op == 0x2A:
+            hl = self._rr(4, 5); self.r8[7] = gb.read(hl)
+            self._set_rr(4, 5, (hl + 1) & 0xFFFF); return 8
+        if op == 0x3A:
+            hl = self._rr(4, 5); self.r8[7] = gb.read(hl)
+            self._set_rr(4, 5, (hl - 1) & 0xFFFF); return 8
+        if op == 0xE0:                                                   # LDH (a8), A
+            a8 = gb.read(self.pc); self.pc = (self.pc + 1) & 0xFFFF
+            gb.write(0xFF00 | a8, self.r8[7]); return 12
+        if op == 0xF0:                                                   # LDH A, (a8)
+            a8 = gb.read(self.pc); self.pc = (self.pc + 1) & 0xFFFF
+            self.r8[7] = gb.read(0xFF00 | a8); return 12
+        if op == 0xE2: gb.write(0xFF00 | self.r8[1], self.r8[7]); return 8
+        if op == 0xF2: self.r8[7] = gb.read(0xFF00 | self.r8[1]); return 8
+        if op == 0xEA:
+            ad = self._read16(self.pc); self.pc = (self.pc + 2) & 0xFFFF
+            gb.write(ad, self.r8[7]); return 16
+        if op == 0xFA:
+            ad = self._read16(self.pc); self.pc = (self.pc + 2) & 0xFFFF
+            self.r8[7] = gb.read(ad); return 16
+        if op == 0x08:
+            ad = self._read16(self.pc); self.pc = (self.pc + 2) & 0xFFFF
+            gb.write(ad, self.sp & 0xFF); gb.write((ad + 1) & 0xFFFF, self.sp >> 8); return 20
+        if op in (0x18, 0x20, 0x28, 0x30, 0x38):                         # JR
+            off = gb.read(self.pc); self.pc = (self.pc + 1) & 0xFFFF
+            if off & 0x80: off -= 256
+            cond = True if op == 0x18 else (
+                not (self.f & 0x80) if op == 0x20 else (
+                bool(self.f & 0x80) if op == 0x28 else (
+                not (self.f & 0x10) if op == 0x30 else bool(self.f & 0x10))))
+            if cond:
+                self.pc = (self.pc + off) & 0xFFFF
+                return 12
+            return 8
+        if op in (0xC3, 0xC2, 0xCA, 0xD2, 0xDA):                         # JP
+            ad = self._read16(self.pc); self.pc = (self.pc + 2) & 0xFFFF
+            cond = True if op == 0xC3 else (
+                not (self.f & 0x80) if op == 0xC2 else (
+                bool(self.f & 0x80) if op == 0xCA else (
+                not (self.f & 0x10) if op == 0xD2 else bool(self.f & 0x10))))
+            if cond:
+                self.pc = ad
+                return 16
+            return 12
+        if op == 0xE9: self.pc = self._rr(4, 5); return 4                # JP (HL)
+        if op in (0xCD, 0xC4, 0xCC, 0xD4, 0xDC):                         # CALL
+            ad = self._read16(self.pc); self.pc = (self.pc + 2) & 0xFFFF
+            cond = True if op == 0xCD else (
+                not (self.f & 0x80) if op == 0xC4 else (
+                bool(self.f & 0x80) if op == 0xCC else (
+                not (self.f & 0x10) if op == 0xD4 else bool(self.f & 0x10))))
+            if cond:
+                self._push16(self.pc); self.pc = ad; return 24
+            return 12
+        if op in (0xC9, 0xD9, 0xC0, 0xC8, 0xD0, 0xD8):                   # RET / RETI
+            if op == 0xD9:
+                self.pc = self._pop16(); self.ime_delay = True; return 16
+            if op == 0xC9:
+                self.pc = self._pop16(); return 16
+            cond = (not (self.f & 0x80) if op == 0xC0 else (
+                    bool(self.f & 0x80) if op == 0xC8 else (
+                    not (self.f & 0x10) if op == 0xD0 else bool(self.f & 0x10))))
+            if cond:
+                self.pc = self._pop16(); return 20
+            return 8
+        if (op & 0xC7) == 0xC7:                                          # RST
+            self._push16(self.pc); self.pc = op & 0x38; return 16
+        if op in (0xC5, 0xD5, 0xE5, 0xF5):                               # PUSH
+            v = (self._rr(0, 1), self._rr(2, 3), self._rr(4, 5),
+                 (self.r8[7] << 8) | (self.f & 0xF0))[(op >> 4) & 3]
+            self._push16(v); return 16
+        if op in (0xC1, 0xD1, 0xE1, 0xF1):                               # POP
+            v = self._pop16()
+            reg = (op >> 4) & 3
+            if reg == 0: self._set_rr(0, 1, v)
+            elif reg == 1: self._set_rr(2, 3, v)
+            elif reg == 2: self._set_rr(4, 5, v)
+            else: self.r8[7] = v >> 8; self.f = v & 0xF0
+            return 12
+        if op == 0x07:                                                   # RLCA
+            c = (self.r8[7] >> 7) & 1
+            self.r8[7] = ((self.r8[7] << 1) | c) & 0xFF; self.f = c << 4; return 4
+        if op == 0x0F:                                                   # RRCA
+            c = self.r8[7] & 1
+            self.r8[7] = ((self.r8[7] >> 1) | (c << 7)) & 0xFF; self.f = c << 4; return 4
+        if op == 0x17:                                                   # RLA
+            c = (self.r8[7] >> 7) & 1
+            self.r8[7] = ((self.r8[7] << 1) | ((self.f >> 4) & 1)) & 0xFF; self.f = c << 4; return 4
+        if op == 0x1F:                                                   # RRA
+            c = self.r8[7] & 1
+            self.r8[7] = ((self.r8[7] >> 1) | (((self.f >> 4) & 1) << 7)) & 0xFF; self.f = c << 4; return 4
+        if op == 0x2F:                                                   # CPL
+            self.r8[7] ^= 0xFF; self.f = (self.f & 0x90) | 0x60; return 4
+        if op == 0x37:                                                   # SCF
+            self.f = (self.f & 0x80) | 0x10; return 4
+        if op == 0x3F:                                                   # CCF
+            self.f = (self.f & 0x80) ^ 0x10; return 4
+        if op == 0xF9:                                                   # LD SP, HL
+            self.sp = self._rr(4, 5); return 8
+        if op in (0xE8, 0xF8):                                           # ADD SP, r8 / LD HL, SP+r8
+            off = gb.read(self.pc); self.pc = (self.pc + 1) & 0xFFFF
+            s8 = (off - 256) if (off & 0x80) else off
+            r = (self.sp + s8) & 0xFFFF
+            self.f = (0x20 if ((self.sp & 15) + (off & 15)) > 15 else 0) | (0x10 if ((self.sp & 0xFF) + off) > 0xFF else 0)
+            if op == 0xE8:
+                self.sp = r; return 16
+            self._set_rr(4, 5, r); return 12
+        if op == 0x27:                                                   # DAA
+            a = self.r8[7]
+            if not (self.f & 0x40):
+                if (self.f & 0x20) or (a & 0x0F) > 9: a += 0x06
+                if (self.f & 0x10) or a > 0x9F: a += 0x60; self.f |= 0x10
+            else:
+                if self.f & 0x20: a = (a - 6) & 0xFF
+                if self.f & 0x10: a = (a - 0x60) & 0xFF
+                else:
+                    if (a & 0x0F) > 9: a -= 0x06
+                self.f &= ~0x10
+            self.r8[7] = a & 0xFF
+            self.f = (self.f & 0x50) | (0x80 if self.r8[7] == 0 else 0)
+            return 4
+        if op == 0xCB:                                                   # CB prefix
+            cb = gb.read(self.pc); self.pc = (self.pc + 1) & 0xFFFF
+            return self._exec_cb(cb)
+        return 4
+
+    def _exec_cb(self, cb):
+        idx = cb & 7
+        grp = cb >> 6
+        sub = (cb >> 3) & 7
+        v = self._get_r(idx)
+        if grp == 0:  # rotates / shifts / swap
+            old_c = (self.f >> 4) & 1
+            if sub == 0: c = (v >> 7) & 1; r = ((v << 1) | c) & 0xFF
+            elif sub == 1: c = v & 1; r = ((v >> 1) | (c << 7)) & 0xFF
+            elif sub == 2: c = (v >> 7) & 1; r = ((v << 1) | old_c) & 0xFF
+            elif sub == 3: c = v & 1; r = ((v >> 1) | (old_c << 7)) & 0xFF
+            elif sub == 4: c = (v >> 7) & 1; r = (v << 1) & 0xFF
+            elif sub == 5: c = v & 1; r = (v >> 1) | (v & 0x80)
+            elif sub == 6: c = 0; r = ((v & 0x0F) << 4) | (v >> 4)
+            else: c = v & 1; r = v >> 1
+            self._set_r(idx, r)
+            self.f = (0x80 if r == 0 else 0) | (c << 4)
+            return 16 if idx == 6 else 8
+        if grp == 1:  # BIT
+            self.f = (self.f & 0x10) | 0x20 | (0 if (v & (1 << sub)) else 0x80)
+            return 12 if idx == 6 else 8
+        if grp == 2:  # RES
+            self._set_r(idx, v & ~(1 << sub))
+            return 16 if idx == 6 else 8
+        self._set_r(idx, v | (1 << sub))  # SET
+        return 16 if idx == 6 else 8
+
+
+class GBPPU:
+    """ rewritten Game Boy / Game Boy Color PPU, driven per CPU step.
+
+    Mode timing per scanline (OAM scan 80, drawing ~172, HBlank 204+),
+    STAT interrupts on OAM/HBlank/VBlank/LYC with rising-edge detection,
+    LYC compare, and an internal window line counter. Each visible line is
+    composited into the framebuffer the moment the line finishes drawing
+    (mode 3 -> 0), so mid-frame writes affect the exact expected scanline.
+    """
+    LINE_T = 456
+    VISIBLE = 144
+    TOTAL_LINES = 154
+    FRAME_T = LINE_T * TOTAL_LINES  # 70224 T-cycles
+
+    def __init__(self, gb):
+        self.gb = gb
+        self.cgb = gb.cgb
+        self.ly = 0
+        self.mode = 2
+        self.line_cyc = 0
+        self.frame_cyc = 0
+        self.win_line = 0
+        self.stat_line = False
+        self.sprites = []
+
+    def reset(self):
+        self.ly = 0
+        self.mode = 2
+        self.line_cyc = 0
+        self.frame_cyc = 0
+        self.win_line = 0
+        self.stat_line = False
+        self.sprites = []
+        io = self.gb.io
+        io[0x44] = 0
+        io[0x41] = (io[0x41] & 0x78) | 2
+
+    def capture_state(self):
+        return {
+            "ly": self.ly, "mode": self.mode, "line_cyc": self.line_cyc,
+            "frame_cyc": self.frame_cyc, "win_line": self.win_line,
+            "stat_line": self.stat_line, "sprites": list(self.sprites),
+        }
+
+    def restore_state(self, st):
+        if not st:
+            return
+        self.ly = st.get("ly", 0)
+        self.mode = st.get("mode", 2)
+        self.line_cyc = st.get("line_cyc", 0)
+        self.frame_cyc = st.get("frame_cyc", 0)
+        self.win_line = st.get("win_line", 0)
+        self.stat_line = st.get("stat_line", False)
+        self.sprites = list(st.get("sprites", []))
+        io = self.gb.io
+        io[0x44] = self.ly
+        io[0x41] = (io[0x41] & 0x78) | (self.mode & 3)
+
+    def _lcd_on(self):
+        return bool(self.gb.io[0x40] & 0x80)
+
+    def _raise_stat(self, io):
+        io[0x0F] |= 0x02
+
+    def _update_stat_line(self, io):
+        stat = io[0x41]
+        mode = self.mode
+        line = False
+        if stat & 0x40 and io[0x45] == self.ly and self.ly < self.TOTAL_LINES:
+            line = True
+        if (stat & 0x20 and mode == 2) or (stat & 0x08 and mode == 0) or (stat & 0x10 and mode == 1):
+            line = True
+        if line and not self.stat_line:
+            io[0x0F] |= 0x02
+        self.stat_line = line
+
+    def tick(self, cycles):
+        if not self._lcd_on():
+            self.ly = 0
+            self.mode = 0
+            self.line_cyc = 0
+            self.frame_cyc = 0
+            self.win_line = 0
+            io = self.gb.io
+            io[0x44] = 0
+            io[0x41] = (io[0x41] & 0xFC) | 0
+            return
+        self.frame_cyc += cycles
+        self.line_cyc += cycles
+        io = self.gb.io
+        while self.line_cyc >= self.LINE_T:
+            self.line_cyc -= self.LINE_T
+            self._end_line(io)
+        # Mode boundaries within the line
+        m = 2 if self.line_cyc < 80 else (3 if self.line_cyc < 252 else 0)
+        vis = self.ly < self.VISIBLE
+        if not vis:
+            m = 1
+        if m != self.mode:
+            self._enter_mode(m, io)
+
+    def _enter_mode(self, m, io):
+        prev = self.mode
+        self.mode = m
+        io[0x41] = (io[0x41] & 0xFC) | m
+        if m == 0 and self.ly < self.VISIBLE:
+            if io[0x41] & 0x08:
+                io[0x0F] |= 0x02
+            self.gb._run_hblank_dma()
+        elif m == 2 and self.ly < self.VISIBLE:
+            if io[0x41] & 0x20:
+                io[0x0F] |= 0x02
+            self._scan_oam(io)
+        elif m == 1:
+            if io[0x41] & 0x10:
+                io[0x0F] |= 0x02
+        self._update_stat_line(io)
+
+    def _end_line(self, io):
+        was_vblank = self.ly >= self.VISIBLE
+        self.ly = 0 if self.ly == self.TOTAL_LINES - 1 else self.ly + 1
+        io[0x44] = self.ly
+        if self.ly == self.VISIBLE:
+            self.mode = 1
+            io[0x41] = (io[0x41] & 0xFC) | 1
+            io[0x0F] |= 0x01
+        elif self.ly < self.VISIBLE and not was_vblank:
+            self.mode = 2
+            io[0x41] = (io[0x41] & 0xFC) | 2
+            self._scan_oam(io)
+            self._render_line(io)
+        self._update_stat_line(io)
+
+    def _cgb_bg_lut(self):
+        gb = self.gb
+        cg_bg = np.frombuffer(gb.bg_pal, dtype="<u2")
+        lut = np.empty((256, 4), dtype=np.uint8)
+        r5 = ((cg_bg & 0x1F) << 3) | ((cg_bg & 0x1F) >> 2)
+        g5 = (((cg_bg >> 5) & 0x1F) << 3) | (((cg_bg >> 5) & 0x1F) >> 2)
+        b5 = (((cg_bg >> 10) & 0x1F) << 3) | (((cg_bg >> 10) & 0x1F) >> 2)
+        for p in range(8):
+            sl = slice(p * 4, p * 4 + 4)
+            lut[sl, 0] = r5[sl]
+            lut[sl, 1] = g5[sl]
+            lut[sl, 2] = b5[sl]
+            lut[sl, 3] = 255
+        return lut
+
+    def _cgb_obj_lut(self):
+        gb = self.gb
+        cg_ob = np.frombuffer(gb.obj_pal, dtype="<u2")
+        r5 = ((cg_ob & 0x1F) << 3) | ((cg_ob & 0x1F) >> 2)
+        g5 = (((cg_ob >> 5) & 0x1F) << 3) | (((cg_ob >> 5) & 0x1F) >> 2)
+        b5 = (((cg_ob >> 10) & 0x1F) << 3) | (((cg_ob >> 10) & 0x1F) >> 2)
+        lut = np.empty((256, 4), dtype=np.uint8)
+        for p in range(8):
+            sl = slice(p * 4, p * 4 + 4)
+            lut[sl, 0] = r5[sl]
+            lut[sl, 1] = g5[sl]
+            lut[sl, 2] = b5[sl]
+            lut[sl, 3] = 255
+        return lut
+
+    def _render_line(self, io):
+        ly = self.ly
+        if ly >= self.VISIBLE:
+            return
+        lcdc = io[0x40]
+        use_cgb = self.cgb
+        frame = self.gb.frame_rgba
+        row_c = np.zeros(160, dtype=np.int32)
+        row_pri = None
+        if not (lcdc & 0x01):
+            frame[ly] = self._cgb_bg_lut()[0] if use_cgb else _GB_DMG_PAL[0]
+        else:
+            scx, scy = io[0x43], io[0x42]
+            wy, wx = io[0x4A], io[0x4B]
+            bg_map = 0x1C00 if (lcdc & 0x08) else 0x1800
+            win_map = 0x1C00 if (lcdc & 0x40) else 0x1800
+            unsigned_tiles = bool(lcdc & 0x10)
+            vram = np.frombuffer(self.gb.vram, dtype=np.uint8)
+            xs = np.arange(160, dtype=np.int32)
+            win_show = (lcdc & 0x20) and wy <= ly < self.VISIBLE and wx < 160 and wx <= 166
+            if win_show:
+                in_win = xs >= (wx - 7)
+                w_row = self.win_line
+            else:
+                in_win = np.zeros(160, dtype=bool)
+                w_row = 0
+            px = np.where(in_win, xs - (wx - 7), (xs + scx) & 0xFF)
+            py = np.where(in_win, w_row, (ly + scy) & 0xFF)
+            tmap = np.where(in_win, win_map, bg_map)
+            m_off = ((tmap + ((py >> 3) << 5) + (px >> 3)) & 0x1FFF).astype(np.int32)
+            tile = vram[m_off].astype(np.int32)
+            if use_cgb:
+                attr = vram[0x2000 | m_off]
+                vbank = np.where((attr & 0x08) != 0, 0x2000, 0)
+                fy = np.where((attr & 0x40) != 0, 7 - (py & 7), py & 7)
+                fx = np.where((attr & 0x20) != 0, 7 - (px & 7), px & 7)
+            else:
+                attr = np.zeros(160, dtype=np.uint8)
+                vbank = 0
+                fy = py & 7
+                fx = 7 - (px & 7)
+            if unsigned_tiles:
+                t_addr = vbank + (tile << 4) + (fy << 1)
+            else:
+                s_tile = np.where(tile >= 128, tile - 256, tile)
+                t_addr = vbank + 0x1000 + (s_tile << 4) + (fy << 1)
+            lo = vram[t_addr & 0x3FFF]
+            hi = vram[(t_addr + 1) & 0x3FFF]
+            c = ((lo >> fx) & 1) | (((hi >> fx) & 1) << 1)
+            row_c[:] = c
+            if win_show:
+                self.win_line += 1
+            if use_cgb:
+                frame[ly] = self._cgb_bg_lut()[((attr & 7) << 2) | c]
+                row_pri = (attr & 0x80) != 0
+            else:
+                bgp = io[0x47]
+                shade = (bgp >> (c * 2)) & 3
+                frame[ly] = _GB_DMG_PAL[shade]
+        if lcdc & 0x02:
+            self._render_sprites_row(io, ly, row_c,
+                                     self._cgb_obj_lut() if use_cgb else None,
+                                     row_pri)
+
+    def _render_sprites_row(self, io, ly, row_c,
+                            ob_lut, row_pri=None):
+        lcdc = io[0x40]
+        sh = 16 if (lcdc & 0x04) else 8
+        oam = self.gb.oam
+        vram = self.gb.vram
+        use_cgb = self.cgb
+        dmg_ob0 = dmg_ob1 = None
+        if not use_cgb:
+            obp0, obp1 = io[0x48], io[0x49]
+            dmg_ob0 = np.array([_GB_DMG_PAL[(obp0 >> (i * 2)) & 3] for i in range(4)], dtype=np.uint8)
+            dmg_ob1 = np.array([_GB_DMG_PAL[(obp1 >> (i * 2)) & 3] for i in range(4)], dtype=np.uint8)
+        frame = self.gb.frame_rgba
+        for i in reversed(self.sprites):
+            sy = oam[i * 4] - 16
+            sx = oam[i * 4 + 1] - 8
+            if sx <= -8 or sx >= 160 or ly < sy or ly >= sy + sh:
+                continue
+            tile_i = oam[i * 4 + 2] & (0xFE if sh == 16 else 0xFF)
+            attr_i = oam[i * 4 + 3]
+            vbank_i = 0x2000 if (use_cgb and (attr_i & 0x08)) else 0
+            row = ly - sy
+            fy = (sh - 1 - row) if (attr_i & 0x40) else row
+            t_addr = vbank_i + (tile_i << 4) + (fy << 1)
+            lo_i, hi_i = int(vram[t_addr & 0x3FFF]), int(vram[(t_addr + 1) & 0x3FFF])
+            pix = PIX[(hi_i << 8) | lo_i]
+            if attr_i & 0x20:
+                pix = pix[::-1]
+            x0 = max(0, sx)
+            x1 = min(160, sx + 8)
+            sl = pix[(x0 - sx):(x1 - sx)]
+            nz = sl != 0
+            if not nz.any():
+                continue
+            if use_cgb:
+                if attr_i & 0x80:
+                    nz &= row_c[x0:x1] == 0
+                if row_pri is not None:
+                    nz &= ~(row_pri[x0:x1] & (row_c[x0:x1] != 0))
+                if not nz.any():
+                    continue
+                frame[ly, x0:x1][nz] = ob_lut[((attr_i & 7) << 2) | sl[nz]]
+            else:
+                pal_i = dmg_ob1 if (attr_i & 0x10) else dmg_ob0
+                frame[ly, x0:x1][nz] = pal_i[sl[nz]]
+
+    def _scan_oam(self, io):
+        lcdc = io[0x40]
+        if not (lcdc & 0x80) or not (lcdc & 0x02):
+            self.sprites = []
+            return
+        sh = 16 if (lcdc & 0x04) else 8
+        oam = self.gb.oam
+        picked = []
+        ly = self.ly
+        for i in range(40):
+            sy = oam[i * 4] - 16
+            if ly < sy or ly >= sy + sh:
+                continue
+            picked.append(i)
+            if len(picked) == 10:
+                break
+        self.sprites = picked
+
 class GameBoy:
     """Pure-Python Game Boy (DMG) & Game Boy Color (CGB) Emulator (Sharp LR35902 + PPU + MBC1/3/5)."""
     width = 160
@@ -4429,11 +5477,14 @@ class GameBoy:
         self.ocpd_idx = 0
         self.frame_rgba = np.zeros((144, 160, 4), dtype=np.uint8)
         self.frame_rgba[:, :, 3] = 255
-        self.apu = SNESAPU(sample_rate, mode="gb")
-        self.apu.gb_io = self.io
+        self.cpu = GBCPU(self)
+        self.ppu = GBPPU(self)
+        self.apu = GBAPU(sample_rate)
+        self.apu.set_io(self.io)
         self.buttons = 0
         self.frames = 0
         self._hdma_active = False
+        self._speed_rem = 0
         self._load_battery()
         self.reset()
         self._skip_boot_blank_gb()
@@ -4463,24 +5514,17 @@ class GameBoy:
             f.write(bytes(self.eram))
 
     def reset(self):
-        self.a = 0x11 if self.cgb else 0x01
-        self.f = 0xB0
-        self.b = 0x00
-        self.c = 0x13
-        self.d = 0x00
-        self.e = 0xD8
-        self.h = 0x01
-        self.l = 0x4D
-        self.sp = 0xFFFE
-        self.pc = 0x0100
-        self.ime = False
-        self.halted = False
+        self.cpu.reset(self.cgb)
+        self.ppu.reset()
         self.div_cycles = 0
         self.tima_cycles = 0
         self.io[0x40] = 0x91  # LCDC
         self.io[0x47] = 0xFC  # BGP
         self.io[0x48] = 0xFF  # OBP0
         self.io[0x49] = 0xFF  # OBP1
+        self.io[0x04] = 0
+        if hasattr(self.apu, "set_io"):
+            self.apu.set_io(self.io)
         self.bg_pal[:] = b"\xFF\x7F" * 32
         self.obj_pal[:] = b"\xFF\x7F" * 32
         if getattr(self, "_boot_done_gb", False):
@@ -4607,6 +5651,11 @@ class GameBoy:
                         self.write(dst + i, self.read(src + i))
                     self.io[0x55] = 0xFF
                     self._hdma_active = False
+            elif r == 0x26:
+                if not (val & 0x80):
+                    self.apu.power_off()
+            elif 0x10 <= r <= 0x3F:
+                self.apu.write(r, val, self.io)
             elif r == 0x68:
                 self.bcpd_idx = val
             elif r == 0x69:
@@ -4626,292 +5675,9 @@ class GameBoy:
         else:
             self.hram[0x7F] = val
 
-    def _read16(self, addr):
-        return self.read(addr) | (self.read((addr + 1) & 0xFFFF) << 8)
-
-    def _push16(self, val):
-        self.sp = (self.sp - 1) & 0xFFFF
-        self.write(self.sp, (val >> 8) & 0xFF)
-        self.sp = (self.sp - 1) & 0xFFFF
-        self.write(self.sp, val & 0xFF)
-
-    def _pop16(self):
-        lo = self.read(self.sp)
-        self.sp = (self.sp + 1) & 0xFFFF
-        hi = self.read(self.sp)
-        self.sp = (self.sp + 1) & 0xFFFF
-        return (hi << 8) | lo
-
-    def _get_r(self, idx):
-        if idx == 0: return self.b
-        if idx == 1: return self.c
-        if idx == 2: return self.d
-        if idx == 3: return self.e
-        if idx == 4: return self.h
-        if idx == 5: return self.l
-        if idx == 6: return self.read((self.h << 8) | self.l)
-        return self.a
-
-    def _set_r(self, idx, val):
-        val &= 0xFF
-        if idx == 0: self.b = val
-        elif idx == 1: self.c = val
-        elif idx == 2: self.d = val
-        elif idx == 3: self.e = val
-        elif idx == 4: self.h = val
-        elif idx == 5: self.l = val
-        elif idx == 6: self.write((self.h << 8) | self.l, val)
-        else: self.a = val
-
-    def _alu(self, op, val):
-        a = self.a
-        c = (self.f >> 4) & 1
-        if op == 0:  # ADD
-            r = a + val
-            self.f = (0x80 if (r & 0xFF) == 0 else 0) | (0x20 if (a & 15) + (val & 15) > 15 else 0) | (0x10 if r > 255 else 0)
-            self.a = r & 0xFF
-        elif op == 1:  # ADC
-            r = a + val + c
-            self.f = (0x80 if (r & 0xFF) == 0 else 0) | (0x20 if (a & 15) + (val & 15) + c > 15 else 0) | (0x10 if r > 255 else 0)
-            self.a = r & 0xFF
-        elif op == 2:  # SUB
-            r = a - val
-            self.f = 0x40 | (0x80 if (r & 0xFF) == 0 else 0) | (0x20 if (a & 15) < (val & 15) else 0) | (0x10 if r < 0 else 0)
-            self.a = r & 0xFF
-        elif op == 3:  # SBC
-            r = a - val - c
-            self.f = 0x40 | (0x80 if (r & 0xFF) == 0 else 0) | (0x20 if (a & 15) < (val & 15) + c else 0) | (0x10 if r < 0 else 0)
-            self.a = r & 0xFF
-        elif op == 4:  # AND
-            self.a = a & val
-            self.f = (0x80 if self.a == 0 else 0) | 0x20
-        elif op == 5:  # XOR
-            self.a = a ^ val
-            self.f = 0x80 if self.a == 0 else 0
-        elif op == 6:  # OR
-            self.a = a | val
-            self.f = 0x80 if self.a == 0 else 0
-        elif op == 7:  # CP
-            r = a - val
-            self.f = 0x40 | (0x80 if (r & 0xFF) == 0 else 0) | (0x20 if (a & 15) < (val & 15) else 0) | (0x10 if r < 0 else 0)
-
     def step(self):
-        ie = self.hram[0x7F]
-        if_reg = self.io[0x0F]
-        pending = ie & if_reg & 0x1F
-        if pending:
-            self.halted = False
-            if self.ime:
-                self.ime = False
-                for bit in range(5):
-                    if pending & (1 << bit):
-                        self.io[0x0F] &= ~(1 << bit)
-                        self._push16(self.pc)
-                        self.pc = 0x40 + (bit << 3)
-                        return 20
-        if self.halted:
-            return 4
-
-        op = self.read(self.pc)
-        self.pc = (self.pc + 1) & 0xFFFF
-
-        if op == 0x00: return 4                                        # NOP
-        if op == 0x10:                                                 # STOP / CGB Speed Switch
-            self.pc = (self.pc + 1) & 0xFFFF
-            if self.io[0x4D] & 1:
-                self.io[0x4D] = ((self.io[0x4D] ^ 0x80) & 0x80) | 0x7E
-            return 4
-        if op == 0x76: self.halted = True; return 4                    # HALT
-        if op == 0xF3: self.ime = False; return 4                      # DI
-        if op == 0xFB: self.ime = True; return 4                       # EI
-        if 0x40 <= op <= 0x7F:                                         # LD r, r'
-            self._set_r((op >> 3) & 7, self._get_r(op & 7))
-            return 8 if ((op & 7) == 6 or ((op >> 3) & 7) == 6) else 4
-        if 0x80 <= op <= 0xBF:                                         # ALU A, r
-            self._alu((op >> 3) & 7, self._get_r(op & 7))
-            return 8 if (op & 7) == 6 else 4
-        if (op & 0xC7) == 0x06:                                        # LD r, d8
-            v = self.read(self.pc); self.pc = (self.pc + 1) & 0xFFFF
-            self._set_r((op >> 3) & 7, v)
-            return 8
-        if (op & 0xC7) == 0x04:                                        # INC r
-            idx = (op >> 3) & 7
-            v = self._get_r(idx); r = (v + 1) & 0xFF; self._set_r(idx, r)
-            self.f = (self.f & 0x10) | (0x80 if r == 0 else 0) | (0x20 if (v & 15) == 15 else 0)
-            return 12 if idx == 6 else 4
-        if (op & 0xC7) == 0x05:                                        # DEC r
-            idx = (op >> 3) & 7
-            v = self._get_r(idx); r = (v - 1) & 0xFF; self._set_r(idx, r)
-            self.f = (self.f & 0x10) | 0x40 | (0x80 if r == 0 else 0) | (0x20 if (v & 15) == 0 else 0)
-            return 12 if idx == 6 else 4
-        if (op & 0xC7) == 0xC6:                                        # ALU A, d8
-            v = self.read(self.pc); self.pc = (self.pc + 1) & 0xFFFF
-            self._alu((op >> 3) & 7, v)
-            return 8
-        if op in (0x01, 0x11, 0x21, 0x31):                             # LD rr, d16
-            v = self._read16(self.pc); self.pc = (self.pc + 2) & 0xFFFF
-            if op == 0x01: self.b, self.c = v >> 8, v & 0xFF
-            elif op == 0x11: self.d, self.e = v >> 8, v & 0xFF
-            elif op == 0x21: self.h, self.l = v >> 8, v & 0xFF
-            else: self.sp = v
-            return 12
-        if op in (0x03, 0x13, 0x23, 0x33, 0x0B, 0x1B, 0x2B, 0x3B):     # INC/DEC rr
-            d = 1 if (op & 8) == 0 else -1
-            reg = (op >> 4) & 3
-            if reg == 0: v = ((self.b << 8) | self.c) + d; self.b, self.c = (v >> 8) & 0xFF, v & 0xFF
-            elif reg == 1: v = ((self.d << 8) | self.e) + d; self.d, self.e = (v >> 8) & 0xFF, v & 0xFF
-            elif reg == 2: v = ((self.h << 8) | self.l) + d; self.h, self.l = (v >> 8) & 0xFF, v & 0xFF
-            else: self.sp = (self.sp + d) & 0xFFFF
-            return 8
-        if op in (0x09, 0x19, 0x29, 0x39):                             # ADD HL, rr
-            hl = (self.h << 8) | self.l
-            rr = ((self.b << 8) | self.c, (self.d << 8) | self.e, hl, self.sp)[(op >> 4) & 3]
-            r = hl + rr
-            self.f = (self.f & 0x80) | (0x20 if (hl & 0xFFF) + (rr & 0xFFF) > 0xFFF else 0) | (0x10 if r > 0xFFFF else 0)
-            self.h, self.l = (r >> 8) & 0xFF, r & 0xFF
-            return 8
-        if op == 0x02: self.write((self.b << 8) | self.c, self.a); return 8
-        if op == 0x12: self.write((self.d << 8) | self.e, self.a); return 8
-        if op == 0x22:
-            hl = (self.h << 8) | self.l; self.write(hl, self.a)
-            hl = (hl + 1) & 0xFFFF; self.h, self.l = hl >> 8, hl & 0xFF; return 8
-        if op == 0x32:
-            hl = (self.h << 8) | self.l; self.write(hl, self.a)
-            hl = (hl - 1) & 0xFFFF; self.h, self.l = hl >> 8, hl & 0xFF; return 8
-        if op == 0x0A: self.a = self.read((self.b << 8) | self.c); return 8
-        if op == 0x1A: self.a = self.read((self.d << 8) | self.e); return 8
-        if op == 0x2A:
-            hl = (self.h << 8) | self.l; self.a = self.read(hl)
-            hl = (hl + 1) & 0xFFFF; self.h, self.l = hl >> 8, hl & 0xFF; return 8
-        if op == 0x3A:
-            hl = (self.h << 8) | self.l; self.a = self.read(hl)
-            hl = (hl - 1) & 0xFFFF; self.h, self.l = hl >> 8, hl & 0xFF; return 8
-        if op == 0xE0:                                                 # LDH (a8), A
-            a8 = self.read(self.pc); self.pc = (self.pc + 1) & 0xFFFF
-            self.write(0xFF00 | a8, self.a); return 12
-        if op == 0xF0:                                                 # LDH A, (a8)
-            a8 = self.read(self.pc); self.pc = (self.pc + 1) & 0xFFFF
-            self.a = self.read(0xFF00 | a8); return 12
-        if op == 0xE2: self.write(0xFF00 | self.c, self.a); return 8
-        if op == 0xF2: self.a = self.read(0xFF00 | self.c); return 8
-        if op == 0xEA:
-            ad = self._read16(self.pc); self.pc = (self.pc + 2) & 0xFFFF
-            self.write(ad, self.a); return 16
-        if op == 0xFA:
-            ad = self._read16(self.pc); self.pc = (self.pc + 2) & 0xFFFF
-            self.a = self.read(ad); return 16
-        if op == 0x08:
-            ad = self._read16(self.pc); self.pc = (self.pc + 2) & 0xFFFF
-            self.write(ad, self.sp & 0xFF); self.write((ad + 1) & 0xFFFF, self.sp >> 8); return 20
-        if op in (0x18, 0x20, 0x28, 0x30, 0x38):                       # JR
-            off = self.read(self.pc); self.pc = (self.pc + 1) & 0xFFFF
-            if off & 0x80: off -= 256
-            cond = True if op == 0x18 else (
-                not (self.f & 0x80) if op == 0x20 else (
-                bool(self.f & 0x80) if op == 0x28 else (
-                not (self.f & 0x10) if op == 0x30 else bool(self.f & 0x10))))
-            if cond:
-                self.pc = (self.pc + off) & 0xFFFF
-                return 12
-            return 8
-        if op in (0xC3, 0xC2, 0xCA, 0xD2, 0xDA):                       # JP
-            ad = self._read16(self.pc); self.pc = (self.pc + 2) & 0xFFFF
-            cond = True if op == 0xC3 else (
-                not (self.f & 0x80) if op == 0xC2 else (
-                bool(self.f & 0x80) if op == 0xCA else (
-                not (self.f & 0x10) if op == 0xD2 else bool(self.f & 0x10))))
-            if cond:
-                self.pc = ad
-                return 16
-            return 12
-        if op == 0xE9: self.pc = (self.h << 8) | self.l; return 4      # JP (HL)
-        if op in (0xCD, 0xC4, 0xCC, 0xD4, 0xDC):                       # CALL
-            ad = self._read16(self.pc); self.pc = (self.pc + 2) & 0xFFFF
-            cond = True if op == 0xCD else (
-                not (self.f & 0x80) if op == 0xC4 else (
-                bool(self.f & 0x80) if op == 0xCC else (
-                not (self.f & 0x10) if op == 0xD4 else bool(self.f & 0x10))))
-            if cond:
-                self._push16(self.pc); self.pc = ad; return 24
-            return 12
-        if op in (0xC9, 0xD9, 0xC0, 0xC8, 0xD0, 0xD8):                 # RET / RETI
-            if op == 0xD9: self.ime = True; self.pc = self._pop16(); return 16
-            if op == 0xC9: self.pc = self._pop16(); return 16
-            cond = (not (self.f & 0x80) if op == 0xC0 else (
-                    bool(self.f & 0x80) if op == 0xC8 else (
-                    not (self.f & 0x10) if op == 0xD0 else bool(self.f & 0x10))))
-            if cond:
-                self.pc = self._pop16(); return 20
-            return 8
-        if (op & 0xC7) == 0xC7:                                        # RST
-            self._push16(self.pc); self.pc = op & 0x38; return 16
-        if op in (0xC5, 0xD5, 0xE5, 0xF5):                             # PUSH
-            v = ((self.b << 8) | self.c, (self.d << 8) | self.e, (self.h << 8) | self.l, (self.a << 8) | (self.f & 0xF0))[(op >> 4) & 3]
-            self._push16(v); return 16
-        if op in (0xC1, 0xD1, 0xE1, 0xF1):                             # POP
-            v = self._pop16()
-            reg = (op >> 4) & 3
-            if reg == 0: self.b, self.c = v >> 8, v & 0xFF
-            elif reg == 1: self.d, self.e = v >> 8, v & 0xFF
-            elif reg == 2: self.h, self.l = v >> 8, v & 0xFF
-            else: self.a, self.f = v >> 8, v & 0xF0
-            return 12
-        if op == 0x07:                                                 # RLCA
-            c = (self.a >> 7) & 1; self.a = ((self.a << 1) | c) & 0xFF; self.f = c << 4; return 4
-        if op == 0x0F:                                                 # RRCA
-            c = self.a & 1; self.a = ((self.a >> 1) | (c << 7)) & 0xFF; self.f = c << 4; return 4
-        if op == 0x17:                                                 # RLA
-            c = (self.a >> 7) & 1; self.a = ((self.a << 1) | ((self.f >> 4) & 1)) & 0xFF; self.f = c << 4; return 4
-        if op == 0x1F:                                                 # RRA
-            c = self.a & 1; self.a = ((self.a >> 1) | (((self.f >> 4) & 1) << 7)) & 0xFF; self.f = c << 4; return 4
-        if op == 0x2F: self.a ^= 0xFF; self.f = (self.f & 0x90) | 0x60; return 4  # CPL
-        if op == 0x37: self.f = (self.f & 0x80) | 0x10; return 4       # SCF
-        if op == 0x3F: self.f = (self.f & 0x80) ^ 0x10; return 4       # CCF
-        if op == 0xF9: self.sp = (self.h << 8) | self.l; return 8      # LD SP, HL
-        if op in (0xE8, 0xF8):                                         # ADD SP, r8 / LD HL, SP+r8
-            off = self.read(self.pc); self.pc = (self.pc + 1) & 0xFFFF
-            s8 = (off - 256) if (off & 0x80) else off
-            r = (self.sp + s8) & 0xFFFF
-            self.f = (0x20 if ((self.sp & 15) + (off & 15)) > 15 else 0) | (0x10 if ((self.sp & 0xFF) + off) > 0xFF else 0)
-            if op == 0xE8: self.sp = r; return 16
-            self.h, self.l = r >> 8, r & 0xFF; return 12
-        if op == 0x27:                                                 # DAA
-            a = self.a
-            if not (self.f & 0x40):
-                if (self.f & 0x20) or (a & 0x0F) > 9: a += 0x06
-                if (self.f & 0x10) or a > 0x9F: a += 0x60; self.f |= 0x10
-            else:
-                if self.f & 0x20: a = (a - 6) & 0xFF
-                if self.f & 0x10: a = (a - 0x60) & 0xFF
-            self.a = a & 0xFF
-            self.f = (self.f & 0x50) | (0x80 if self.a == 0 else 0)
-            return 4
-        if op == 0xCB:                                                 # CB-prefixed bit/shift instructions
-            cb = self.read(self.pc); self.pc = (self.pc + 1) & 0xFFFF
-            idx = cb & 7
-            v = self._get_r(idx)
-            grp = cb >> 6
-            sub = (cb >> 3) & 7
-            if grp == 0:
-                old_c = (self.f >> 4) & 1
-                if sub == 0: c = (v >> 7) & 1; r = ((v << 1) | c) & 0xFF
-                elif sub == 1: c = v & 1; r = ((v >> 1) | (c << 7)) & 0xFF
-                elif sub == 2: c = (v >> 7) & 1; r = ((v << 1) | old_c) & 0xFF
-                elif sub == 3: c = v & 1; r = ((v >> 1) | (old_c << 7)) & 0xFF
-                elif sub == 4: c = (v >> 7) & 1; r = (v << 1) & 0xFF
-                elif sub == 5: c = v & 1; r = (v >> 1) | (v & 0x80)
-                elif sub == 6: c = 0; r = ((v & 0x0F) << 4) | (v >> 4)
-                else: c = v & 1; r = v >> 1
-                self._set_r(idx, r)
-                self.f = (0x80 if r == 0 else 0) | (c << 4)
-            elif grp == 1:  # BIT
-                self.f = (self.f & 0x10) | 0x20 | (0 if (v & (1 << sub)) else 0x80)
-            elif grp == 2:  # RES
-                self._set_r(idx, v & ~(1 << sub))
-            else:           # SET
-                self._set_r(idx, v | (1 << sub))
-            return 16 if idx == 6 else 8
-        return 4
+        """One CPU instruction (or HALT wake); returns T-cycles consumed."""
+        return self.cpu.step()
 
     def _render_frame(self):
         lcdc = self.io[0x40]
@@ -5016,8 +5782,14 @@ class GameBoy:
                             self.frame_rgba[py_i, x0:x1][nz] = pal_i[sl[nz]]
 
     def capture_state(self):
-        return {
-            "regs": (self.a, self.f, self.b, self.c, self.d, self.e, self.h, self.l, self.sp, self.pc, self.ime, self.halted),
+        st = {
+            "cpu2": {
+                "r8": list(self.cpu.r8), "f": self.cpu.f, "sp": self.cpu.sp,
+                "pc": self.cpu.pc, "ime": self.cpu.ime, "ime_delay": self.cpu.ime_delay,
+                "halted": self.cpu.halted, "halt_bug": self.cpu.halt_bug,
+            },
+            "ppu2": self.ppu.capture_state(),
+            "apu2": self.apu.capture_state(),
             "banks": (self.rom_bank, self.ram_bank, self.vram_bank, self.wram_bank),
             "ram_enable": self.ram_enable, "mbc_mode": self.mbc_mode,
             "div_cycles": self.div_cycles, "tima_cycles": self.tima_cycles,
@@ -5029,21 +5801,40 @@ class GameBoy:
             "buttons": self.buttons, "frames": self.frames,
             "frame_rgba": self.frame_rgba.copy(),
         }
+        return st
 
     def restore_state(self, st):
-        self.a, self.f, self.b, self.c, self.d, self.e, self.h, self.l, self.sp, self.pc, self.ime, self.halted = st["regs"]
-        self.rom_bank, self.ram_bank, self.vram_bank, self.wram_bank = st["banks"]
+        cpu = st.get("cpu2")
+        if cpu:
+            self.cpu.r8 = list(cpu["r8"])
+            self.cpu.f = cpu["f"]
+            self.cpu.sp = cpu["sp"]
+            self.cpu.pc = cpu["pc"]
+            self.cpu.ime = cpu.get("ime", False)
+            self.cpu.ime_delay = cpu.get("ime_delay", False)
+            self.cpu.halted = cpu.get("halted", False)
+            self.cpu.halt_bug = cpu.get("halt_bug", False)
+        self.ppu.restore_state(st.get("ppu2"))
+        self.apu.restore_state(st.get("apu2"))
+        banks = st.get("banks")
+        if banks:
+            self.rom_bank, self.ram_bank, self.vram_bank, self.wram_bank = banks
         self.ram_enable = st.get("ram_enable", False)
         self.mbc_mode = st.get("mbc_mode", 0)
         self.bcpd_idx = st.get("bcpd_idx", 0)
         self.ocpd_idx = st.get("ocpd_idx", 0)
         if "eram" in st:
             self.eram[:] = st["eram"]
-        self.vram[:] = st["vram"]
-        self.wram[:] = st["wram"]
-        self.oam[:] = st["oam"]
-        self.hram[:] = st["hram"]
-        self.io[:] = st["io"]
+        if "vram" in st:
+            self.vram[:] = st["vram"]
+        if "wram" in st:
+            self.wram[:] = st["wram"]
+        if "oam" in st:
+            self.oam[:] = st["oam"]
+        if "hram" in st:
+            self.hram[:] = st["hram"]
+        if "io" in st:
+            self.io[:] = st["io"]
         self.div_cycles = st.get("div_cycles", 0) % 256
         self.tima_cycles = st.get("tima_cycles", 0)
         tac = self.io[0x07]
@@ -5051,14 +5842,17 @@ class GameBoy:
             thresh = (1024, 16, 64, 256)[tac & 3]
             if self.tima_cycles >= thresh:
                 self.tima_cycles %= thresh
-        self.bg_pal[:] = st["bg_pal"]
-        self.obj_pal[:] = st["obj_pal"]
+        if "bg_pal" in st:
+            self.bg_pal[:] = st["bg_pal"]
+        if "obj_pal" in st:
+            self.obj_pal[:] = st["obj_pal"]
         self.buttons = st.get("buttons", 0)
         self.frames = st.get("frames", self.frames)
         if "frame_rgba" in st:
             self.frame_rgba[:] = st["frame_rgba"]
-        # Keep APU linked to the restored IO block
-        self.apu.gb_io = self.io
+        # Keep engines linked to the restored IO block
+        self.apu.set_io(self.io)
+        self.ppu.cgb = self.cgb
 
     def save_state(self, path=None):
         path = path or self.base_path + ".gbstate"
@@ -5073,71 +5867,71 @@ class GameBoy:
             self.restore_state(pickle.load(f))
         return True
 
-    def run_frame(self, draw=True):
-        for ly in range(154):
-            self.io[0x44] = ly
-            stat = self.io[0x41] & 0xF8
-            if ly == self.io[0x45]:
-                stat |= 0x04
-                if stat & 0x40:
-                    self.io[0x0F] |= 0x02
-            if ly >= 144:
-                self.io[0x41] = stat | 0x01
-                if ly == 144:
-                    self.io[0x0F] |= 0x01
-                    if stat & 0x10:
-                        self.io[0x0F] |= 0x02
-            cyc = 0
-            while cyc < 456:
-                if ly < 144:
-                    mode = 2 if cyc < 80 else (3 if cyc < 252 else 0)
-                    if mode != (self.io[0x41] & 3):
-                        self.io[0x41] = (self.io[0x41] & 0xFC) | mode
-                        if (mode == 0 and (self.io[0x41] & 0x08)) or (mode == 2 and (self.io[0x41] & 0x20)):
-                            self.io[0x0F] |= 0x02
-                        # CGB H-blank DMA: 16 bytes per HBlank while active
-                        # and only while the LCD is running (VBlank is mode 1).
-                        if mode == 0 and self._hdma_active and (self.io[0x40] & 0x80):
-                            rem = self.io[0x55] & 0x7F
-                            src = ((self.io[0x51] << 8) | (self.io[0x52] & 0xF0)) & 0xFFFF
-                            dst = (0x8000 | (((self.io[0x53] & 0x1F) << 8) | (self.io[0x54] & 0xF0))) & 0xFFFF
-                            for i in range(16):
-                                self.write(dst + i, self.read(src + i))
-                            # Advance source / dest by 16 and decrement remaining.
-                            src = (src + 16) & 0xFFFF
-                            dst = (dst + 16) & 0xFFFF
-                            self.io[0x51] = (src >> 8) & 0xFF
-                            self.io[0x52] = src & 0xF0
-                            self.io[0x53] = (dst >> 8) & 0x1F
-                            self.io[0x54] = dst & 0xF0
-                            if rem == 0:
-                                self.io[0x55] = 0xFF
-                                self._hdma_active = False
-                            else:
-                                self.io[0x55] = rem - 1
-                if self.halted and not (self.hram[0x7F] & self.io[0x0F] & 0x1F):
-                    c = min(64, 456 - cyc)
+    def _tick_timer(self, c):
+        self.div_cycles += c
+        while self.div_cycles >= 256:
+            self.div_cycles -= 256
+            self.io[0x04] = (self.io[0x04] + 1) & 0xFF
+        tac = self.io[0x07]
+        if tac & 0x04:
+            thresh = (1024, 16, 64, 256)[tac & 3]
+            self.tima_cycles += c
+            while self.tima_cycles >= thresh:
+                self.tima_cycles -= thresh
+                tima = (self.io[0x05] + 1) & 0xFF
+                if tima == 0:
+                    self.io[0x05] = self.io[0x06]
+                    self.io[0x0F] |= 0x04
                 else:
-                    c = self.step()
-                cyc += c
-                self.div_cycles += c
-                if self.div_cycles >= 256:
-                    self.div_cycles -= 256
-                    self.io[0x04] = (self.io[0x04] + 1) & 0xFF
-                tac = self.io[0x07]
-                if tac & 0x04:
-                    thresh = (1024, 16, 64, 256)[tac & 3]
-                    self.tima_cycles += c
-                    while self.tima_cycles >= thresh:
-                        self.tima_cycles -= thresh
-                        tima = (self.io[0x05] + 1) & 0xFF
-                        if tima == 0:
-                            self.io[0x05] = self.io[0x06]
-                            self.io[0x0F] |= 0x04
-                        else:
-                            self.io[0x05] = tima
-        if draw:
-            self._render_frame()
+                    self.io[0x05] = tima
+
+    def _run_hblank_dma(self):
+        # CGB H-blank DMA: 16 bytes per HBlank while active and only while
+        # the LCD is running (the PPU only calls this in mode 0).
+        if not self._hdma_active or self.cgb is False:
+            return
+        if not (self.io[0x40] & 0x80):
+            return
+        rem = self.io[0x55] & 0x7F
+        src = ((self.io[0x51] << 8) | (self.io[0x52] & 0xF0)) & 0xFFFF
+        dst = (0x8000 | (((self.io[0x53] & 0x1F) << 8) | (self.io[0x54] & 0xF0))) & 0xFFFF
+        for i in range(16):
+            self.write(dst + i, self.read(src + i))
+        src = (src + 16) & 0xFFFF
+        dst = (dst + 16) & 0xFFFF
+        self.io[0x51] = (src >> 8) & 0xFF
+        self.io[0x52] = src & 0xF0
+        self.io[0x53] = (dst >> 8) & 0x1F
+        self.io[0x54] = dst & 0xF0
+        if rem == 0:
+            self.io[0x55] = 0xFF
+            self._hdma_active = False
+        else:
+            self.io[0x55] = rem - 1
+
+    def run_frame(self, draw=True):
+        ppu = self.ppu
+        io = self.io
+        speed = 2 if (self.cgb and (io[0x4D] & 0x80)) else 1
+        budget = ppu.FRAME_T * speed
+        step = self.cpu.step
+        apu_tick = self.apu.tick
+        ppu_tick = ppu.tick
+        ran = 0
+        rem = 0
+        while ran < budget:
+            c = step()
+            ran += c
+            rem += c
+            eff = rem // speed
+            rem -= eff * speed
+            if eff:
+                apu_tick(eff, io)
+                self._tick_timer(c)
+                ppu_tick(eff)
+        self._speed_rem = rem
+        if not (io[0x40] & 0x80):
+            self.frame_rgba[:] = _GB_DMG_PAL[0]
         self.apu.run_frame()
         self.frames += 1
 
@@ -7072,6 +7866,7 @@ class RetroWindow(arcade.Window if arcade else object):
         self._opening = False
         self.ui_ptr = (-1, -1)
         self.ui_open = None
+        self.ui_path = []  # hovered parent chain: [item, ...], ui_path[k] opened submenu k+1
         self.ui_overlay = None
         self.ui_toast = None
         self.ui_texts = {}
@@ -7107,8 +7902,8 @@ class RetroWindow(arcade.Window if arcade else object):
             self.rewind_history.clear()
 
     def ui_build_menus(self):
-        def it(label, fn, key="", check=None):
-            return {"label": label, "fn": fn, "key": key, "check": check}
+        def it(label, fn=None, key="", check=None, sub=None):
+            return {"label": label, "fn": fn, "key": key, "check": check, "sub": sub}
 
         cw = self.console.width if self.console else 256
         ch = self.console.height if self.console else 240
@@ -7135,83 +7930,122 @@ class RetroWindow(arcade.Window if arcade else object):
         ]
         # Settings matches the MesenCE menu: Speed, Video Size, Filter, Aspect,
         # Region, then Audio/Emulation/Input/Video, then per-system, then Preferences.
+        # Settings is a nested menu tree: hovering a parent row opens its
+        # submenu to the right (Speed → 0.1x..10x, Audio → Mute/Volume/Latency,
+        # per-system groups, ...), like the reference admin menus.
         settings_m = [
-            it("Speed", lambda: self.ui_show("Speed", [
-                (f"{v:g}x", "current" if abs(self.speed_multiplier - v) < 1e-6 else "")
+            it("Speed", sub=[
+                it(f"{v:g}x", lambda v=v: self.act_speed(v),
+                   check=lambda v=v: abs(self.speed_multiplier - v) < 1e-6)
                 for v in (0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0)
-            ])),
-            it("Video Size", lambda: self.ui_show("Video Size", [
-                (f"{s}x", f"{int(cw * s * self.par)} x {ch * s}") for s in (1, 2, 3, 4, 5, 6)
-            ])),
-            it("Video Filter", lambda: self.ui_show("Video Filter", [
-                ("None", ""), ("Smooth", "bilinear"), ("NTSC", "composite")
-            ])),
-            it("Aspect Ratio", lambda: self.ui_show("Aspect Ratio", [
-                ("Square Pixels", "1:1"), ("NTSC 8:7", "8:7"), ("4:3", "4:3")
-            ])),
-            it("Region / Model", lambda: self.ui_show("Region / Model", [
-                ("Auto", ""), ("NTSC", "60 Hz"), ("PAL", "50 Hz"), ("Dendy", "50 Hz")
-            ])),
+            ]),
+            it("Video Size", sub=[size_item(s) for s in (1, 2, 3, 4, 5, 6)]),
+            it("Video Filter", sub=[
+                it("None", lambda: self.act_smooth() if self.smooth else None,
+                   check=lambda: not self.smooth),
+                it("Smooth", lambda: self.act_smooth() if not self.smooth else None,
+                   key="F", check=lambda: self.smooth),
+                it("NTSC composite", lambda: self.ui_notify("NTSC composite filter: brush TODO")),
+            ]),
+            it("Aspect Ratio", sub=[
+                it("Square Pixels", lambda: self.act_aspect("square"),
+                   check=lambda: self.aspect == "square"),
+                it("NTSC 8:7", lambda: self.act_aspect("ntsc"),
+                   check=lambda: self.aspect == "ntsc"),
+                it("4:3", lambda: self.act_aspect("4:3"),
+                   check=lambda: self.aspect == "4:3"),
+            ]),
+            it("Region / Model", sub=[
+                it("Auto", lambda: self.ui_notify("Region: Auto")),
+                it("NTSC", lambda: self.ui_notify("Region: NTSC (60 Hz)")),
+                it("PAL", lambda: self.ui_notify("Region: PAL (50 Hz)")),
+                it("Dendy", lambda: self.ui_notify("Region: Dendy (50 Hz)")),
+            ]),
             None,
-            it("Show FPS", lambda: setattr(self.settings, "show_fps", not self.settings.show_fps),
-               check=lambda: self.settings.show_fps),
-            it("Show frame counter", lambda: setattr(self.settings, "show_frame_counter", not self.settings.show_frame_counter),
-               check=lambda: self.settings.show_frame_counter),
-            it("Show game timer", lambda: setattr(self.settings, "show_game_timer", not self.settings.show_game_timer),
-               check=lambda: self.settings.show_game_timer),
-            it("Show lag counter", lambda: setattr(self.settings, "show_lag_counter", not self.settings.show_lag_counter),
-               check=lambda: self.settings.show_lag_counter),
-            it("Hide on-screen messages", lambda: setattr(self.settings, "hide_osd", not self.settings.hide_osd),
-               check=lambda: self.settings.hide_osd),
+            it("Audio", sub=[
+                it("Mute", self.act_mute, key="M", check=lambda: self.muted),
+                it("Volume", sub=[
+                    it(f"{p}%", lambda p=p: self.act_volume(p / 100.0),
+                       check=lambda p=p: abs(self.volume - p / 100.0) < 0.01)
+                    for p in (0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+                ]),
+                it("Latency", sub=[
+                    it(f"{ms} ms", lambda ms=ms: self.act_audio_latency(ms),
+                       check=lambda ms=ms: int(self.audio_target * 1000) == ms)
+                    for ms in (20, 40, 60, 80, 100)
+                ]),
+                None,
+                it("Stereo effect", None),
+            ]),
+            it("Video", sub=[
+                it("Fullscreen", self.act_fullscreen, key="F11", check=lambda: self.fullscreen),
+                it("VSync", self.act_vsync, check=lambda: self.use_vsync),
+                it("Smooth filtering", self.act_smooth, key="F",
+                   check=lambda: self.smooth),
+                None,
+                it(f"Backend: {self.settings.video_backend}", None),
+            ]),
+            it("Emulation", sub=[
+                it("Pause", self.act_pause, key="P", check=lambda: self.paused),
+                it("Fast Forward", self.act_turbo, key="Tab", check=lambda: self.turbo),
+                it("Rewind", self.act_reverse, check=lambda: self.reverse_speed),
+            ]),
+            it("Input", sub=[
+                it("Keyboard", None),
+                it("Joypad mapping", lambda: self.ui_show("Controls", HELP_ROWS)),
+            ]),
             None,
-            it("Audio", lambda: self.ui_show("Audio", [
-                ("Mute", "on" if self.muted else "off"),
-                ("Volume", f"{int(self.volume * 100)}%"),
-                ("Latency", f"{int(self.audio_target * 1000)} ms"),
-                ("Stereo effect", self.settings.audio_stereo),
-            ])),
-            it("Emulation", lambda: self.ui_show("Emulation", [
-                ("Pause", "on" if self.paused else "off"),
-                ("Speed", f"{self.speed_multiplier:g}x"),
-                ("Rewind", "on" if self.reverse_speed else "off"),
-            ])),
-            it("Input", lambda: self.ui_show("Input", [
-                ("Keyboard", "mapped"), ("Controller", "auto"),
-            ])),
-            it("Video", lambda: self.ui_show("Video", [
-                ("Fullscreen", "on" if self.fullscreen else "off"),
-                ("VSync", "on" if self.use_vsync else "off"),
-                ("Smooth", "on" if self.smooth else "off"),
-                ("Backend", self.settings.video_backend),
-            ])),
+            it("NES", sub=[
+                it("Remove sprite limit", lambda: setattr(self.settings, "nes_remove_sprite_limit",
+                                                          not self.settings.nes_remove_sprite_limit),
+                   check=lambda: self.settings.nes_remove_sprite_limit),
+                it("Disable background", lambda: setattr(self.settings, "nes_disable_bg",
+                                                          not self.settings.nes_disable_bg),
+                   check=lambda: self.settings.nes_disable_bg),
+                it("Disable sprites", lambda: setattr(self.settings, "nes_disable_sprites",
+                                                       not self.settings.nes_disable_sprites),
+                   check=lambda: self.settings.nes_disable_sprites),
+            ]),
+            it("SNES", sub=[
+                it(f"Power-on RAM: {self.settings.snes_poweron_ram}", None),
+                it(f"SPC clock: {self.settings.snes_spc_clock}%", None),
+                it("Strict boards", lambda: setattr(self.settings, "snes_strict_boards",
+                                                     not self.settings.snes_strict_boards),
+                   check=lambda: self.settings.snes_strict_boards),
+            ]),
+            it("Game Boy", sub=[
+                it("Model: auto", None),
+                None,
+                it("Boot ROM", None),
+                it("SGB border", None),
+            ]),
+            it("GBA", sub=[
+                it("BIOS: HLE", None),
+                it("RTC: on", None),
+            ]),
+            it("Other systems", sub=[
+                it("N64 - VI + software raster", None),
+                it("GBA - ARM7 + DirectSound", None),
+                it("FDS - disk loader", None),
+                None,
+                it("PC Engine / SMS / WonderSwan: not yet", None),
+            ]),
             None,
-            it("NES: remove sprite limit", lambda: setattr(self.settings, "nes_remove_sprite_limit", not self.settings.nes_remove_sprite_limit),
-               check=lambda: self.settings.nes_remove_sprite_limit),
-            it("NES: disable background", lambda: setattr(self.settings, "nes_disable_bg", not self.settings.nes_disable_bg),
-               check=lambda: self.settings.nes_disable_bg),
-            it("NES: disable sprites", lambda: setattr(self.settings, "nes_disable_sprites", not self.settings.nes_disable_sprites),
-               check=lambda: self.settings.nes_disable_sprites),
-            it("SNES", lambda: self.ui_show("SNES", [
-                ("Power-on RAM", self.settings.snes_poweron_ram),
-                ("SPC clock", str(self.settings.snes_spc_clock)),
-                ("Strict boards", "on" if self.settings.snes_strict_boards else "off"),
-            ])),
-            it("Game Boy", lambda: self.ui_show("Game Boy", [("Model", "auto"), ("SGB", "off")])),
-            it("GBA", lambda: self.ui_show("GBA", [("BIOS", "HLE"), ("RTC", "on")])),
-            it("PC Engine", lambda: self.ui_show("PC Engine", [("not yet", "")])),
-            it("SMS", lambda: self.ui_show("SMS", [("not yet", "")])),
-            it("WonderSwan", lambda: self.ui_show("WonderSwan", [("not yet", "")])),
-            it("Other systems", lambda: self.ui_show("Other systems", [
-                ("N64", "VI + software raster"), ("GBA", "ARM7 + DirectSound"),
-                ("FDS", "disk loader"),
-            ])),
-            None,
-            it("Preferences", lambda: self.ui_show("Preferences", [
-                ("Show FPS", "on" if self.settings.show_fps else "off"),
-                ("Show frame counter", "on" if self.settings.show_frame_counter else "off"),
-                ("Autosave", f"{self.settings.autosave_minutes} min"),
-                ("Rewind memory", f"{self.settings.rewind_mb} MB"),
-            ])),
+            it("Preferences", sub=[
+                it("Show FPS", lambda: setattr(self.settings, "show_fps", not self.settings.show_fps),
+                   check=lambda: self.settings.show_fps),
+                it("Show frame counter", lambda: setattr(self.settings, "show_frame_counter", not self.settings.show_frame_counter),
+                   check=lambda: self.settings.show_frame_counter),
+                it("Show game timer", lambda: setattr(self.settings, "show_game_timer", not self.settings.show_game_timer),
+                   check=lambda: self.settings.show_game_timer),
+                it("Show lag counter", lambda: setattr(self.settings, "show_lag_counter", not self.settings.show_lag_counter),
+                   check=lambda: self.settings.show_lag_counter),
+                it("Hide on-screen messages", lambda: setattr(self.settings, "hide_osd", not self.settings.hide_osd),
+                   check=lambda: self.settings.hide_osd),
+                None,
+                it(f"Autosave: {self.settings.autosave_minutes} min", None),
+                it(f"Rewind memory: {self.settings.rewind_mb} MB", None),
+            ]),
         ]
         tools_m = [
             it("Screenshot", self.act_screenshot, "F12"),
@@ -7563,6 +8397,7 @@ class RetroWindow(arcade.Window if arcade else object):
         elif symbol == k.ESCAPE:
             if self.ui_open is not None:
                 self.ui_open = None
+                self.ui_path = []
             else:
                 self.close()
         elif symbol == k.TAB:
@@ -7630,30 +8465,104 @@ class RetroWindow(arcade.Window if arcade else object):
             shifted.append((item, nyt, nyb))
         return shifted, vis_bottom, max_scroll
 
-    def ui_hit_item(self, x, y, wh):
-        i = self.ui_open
-        if i is None:
-            return None
+    def _ui_sub_width(self, item):
+        """Panel width for a submenu (cached on the item dict)."""
+        w = item.get("_sw")
+        if w is None:
+            subs = [s for s in item["sub"] if s]
+            lw = max([self.ui_text(s["label"], C_TEXT).content_width for s in subs] or [0])
+            kw = max([self.ui_text(s["key"], C_DIM).content_width for s in subs if s["key"]] or [0])
+            w = CHECK_W + lw + (36 + kw if kw else 0) + PAD_X + 16
+            item["_sw"] = w
+        return w
+
+    def _ui_panel_chain(self, i, path, wh):
+        """Geometry for the root dropdown plus the open submenu chain above
+        `path` (ui_path[k] is the row that opened panel k+1). Returns a list of
+        {"x0", "w", "rows": [(item, yt, yb)], "clip_top", "y_top", "y_bot"} —
+        animated and clipped exactly like ui_draw_menu paints them."""
+        alpha = max(0.0, min(1.0, getattr(self, "_drop_anim_t", 1.0)))
+        if alpha <= 0.01:
+            return []
+        ww, _ = self.get_size()
         x0 = self.ui_title_x[i][0]
-        drop_w = self.ui_drop_w[i]
-        drop_t = getattr(self, "_drop_anim_t", 1.0)
-        alpha = max(0.0, min(1.0, drop_t))
-        # Mirrors the open animation: rows slide down by slide_y, the panel
-        # grows by scale_w, and rows below the animated top edge are clipped.
-        scale_w = drop_w * (0.94 + 0.06 * alpha)
-        if not (x0 <= x < x0 + scale_w):
-            return None
-        rows, vis_bottom, _ = self.ui_rows(i, wh)
-        if y < vis_bottom or y > wh - MENU_H:
-            return None
+        w = self.ui_drop_w[i]
+        scale_w = w * (0.94 + 0.06 * alpha)
         slide_y = (1.0 - alpha) * 6.0
+        rows, vis_bottom, _ = self.ui_rows(i, wh)
         max_drop_h = max(80, wh - MENU_H - 8)
         open_h = (wh - MENU_H) - vis_bottom
         cur_y_end = (wh - MENU_H - 2) - open_h * alpha
-        for item, yt, yb in rows:
-            if item is None or yb + slide_y < cur_y_end:
-                continue
-            if yb + slide_y <= y < yt + slide_y:
+        arows = [(item, yt + slide_y, yb + slide_y) for item, yt, yb in rows
+                 if yb + slide_y >= cur_y_end]
+        geos = [{"x0": x0, "w": scale_w, "rows": arows,
+                 "clip_top": cur_y_end, "y_top": wh - MENU_H, "y_bot": vis_bottom}]
+        ref_geo, ref_rows = geos[0], arows
+        for parent in path:
+            rect = next(((yt, yb) for (p, yt, yb) in ref_rows if p is parent), None)
+            if rect is None or not parent.get("sub"):
+                break
+            yt_p = rect[0]
+            sw = self._ui_sub_width(parent)
+            sx0 = ref_geo["x0"] + ref_geo["w"] - 1
+            if sx0 + sw > ww:
+                sx0 = ref_geo["x0"] - sw + 1
+            total_h = sum(SEP_H if s is None else ITEM_H for s in parent["sub"])
+            top = min(max(yt_p, vis_bottom), max(vis_bottom, wh - MENU_H - total_h))
+            bot = top - total_h
+            srows = []
+            y = top
+            for s in parent["sub"]:
+                h = SEP_H if s is None else ITEM_H
+                srows.append((s, y, y - h))
+                y -= h
+            geos.append({"x0": sx0, "w": sw, "rows": srows,
+                         "clip_top": vis_bottom, "y_top": top, "y_bot": bot})
+            ref_geo, ref_rows = geos[-1], srows
+        return geos
+
+    @staticmethod
+    def _ui_in_panel(geo, x, y):
+        return geo["x0"] <= x < geo["x0"] + geo["w"] and geo["y_bot"] <= y <= geo["y_top"]
+
+    def _ui_row_at(self, geo, x, y):
+        """Item under (x, y) inside a panel geometry, or None."""
+        if not self._ui_in_panel(geo, x, y):
+            return None
+        for item, yt, yb in geo["rows"]:
+            if item is not None and yb <= y < yt:
+                return item
+        return None
+
+    def ui_update_hover(self, x, y, wh):
+        """Recompute the open submenu chain for the current pointer position."""
+        i = self.ui_open
+        if i is None:
+            self.ui_path = []
+            return
+        path = list(self.ui_path)
+        geos = self._ui_panel_chain(i, path, wh)
+        for depth in reversed(range(len(geos))):
+            geo = geos[depth]
+            if self._ui_in_panel(geo, x, y):
+                item = self._ui_row_at(geo, x, y)
+                if item is not None and item.get("sub"):
+                    self.ui_path = path[:depth] + [item]
+                else:
+                    self.ui_path = path[:depth]
+                return
+        self.ui_path = []
+
+    def ui_hit_item(self, x, y, wh):
+        """Item under the pointer across the root dropdown and any open
+        nested submenus (deepest panel wins)."""
+        i = self.ui_open
+        if i is None:
+            return None
+        geos = self._ui_panel_chain(i, list(getattr(self, "ui_path", [])), wh)
+        for depth in reversed(range(len(geos))):
+            item = self._ui_row_at(geos[depth], x, y)
+            if item is not None:
                 return item
         return None
 
@@ -7668,7 +8577,10 @@ class RetroWindow(arcade.Window if arcade else object):
             t = self.ui_hit_title(x, y, self.get_size()[1])
             if t is not None and t != self.ui_open:
                 self.ui_open = t
+                self.ui_path = []
                 self.ui_menu_scroll = 0.0
+            else:
+                self.ui_update_hover(x, y, self.get_size()[1])
 
     def on_mouse_leave(self, x, y):
         self.ui_ptr = (-1, -1)
@@ -7732,18 +8644,25 @@ class RetroWindow(arcade.Window if arcade else object):
         wh = self.get_size()[1]
         if button != arcade.MOUSE_BUTTON_LEFT:
             self.ui_open = None
+            self.ui_path = []
             return
         t = self.ui_hit_title(x, y, wh)
         if t is not None:
             if self.ui_open == t:
                 self.ui_open = None
+                self.ui_path = []
             else:
                 self.ui_open = t
+                self.ui_path = []
                 self.ui_menu_scroll = 0.0
             return
         if self.ui_open is not None:
+            self.ui_update_hover(x, y, wh)
             item = self.ui_hit_item(x, y, wh)
-            self.ui_open = None
+            keep_open = item is not None and item.get("sub") and not item.get("fn")
+            if not keep_open:
+                self.ui_open = None
+                self.ui_path = []
             if item is not None and item["fn"]:
                 try:
                     item["fn"]()
@@ -7961,7 +8880,9 @@ class RetroWindow(arcade.Window if arcade else object):
                 ym = (yt + yb) / 2 + slide_y
                 self.ui_rect(x0 + 8, ym, x0 + scale_w - 8, ym + 1, (C_EDGE[0], C_EDGE[1], C_EDGE[2], alpha))
                 continue
-            hovered = (self.ui_open is not None) and (x0 <= px < x0 + scale_w and yb + slide_y <= py < yt + slide_y)
+            chain_parent = (self.ui_open is not None) and bool(self.ui_path) and self.ui_path[0] is item
+            ptr_hover = x0 <= px < x0 + scale_w and yb + slide_y <= py < yt + slide_y
+            hovered = (self.ui_open is not None) and (chain_parent or ptr_hover)
             amount = self.ui_tween(("item", i, row_index), 1.0 if hovered else 0.0, anim_dt, 0.18)
             if amount > 0.01:
                 inset = (1.0 - amount) * 5.0
@@ -7988,6 +8909,14 @@ class RetroWindow(arcade.Window if arcade else object):
                 self.ui_put(self.ui_text(item["label"], C_TEXT), x0 + CHECK_W + amount * 3.5, cy)
                 if item["key"]:
                     self.ui_put(self.ui_text(item["key"], C_DIM, anchor_x="right"), x0 + scale_w - PAD_X, cy)
+            if item.get("sub"):
+                self._ui_arrow(x0 + scale_w, cy, amount, alpha)
+
+        # Nested submenu chain (drawn last so deeper panels sit on top)
+        if self.ui_open is not None:
+            geos = self._ui_panel_chain(i, list(getattr(self, "ui_path", [])), wh)
+            for depth in range(1, len(geos)):
+                self._ui_draw_sub_panel(geos, depth, wh, alpha, anim_dt)
 
         # Scrollbar when content overflows
         if max_scroll > 0 and alpha > 0.4:
@@ -8001,6 +8930,62 @@ class RetroWindow(arcade.Window if arcade else object):
                          (C_EDGE[0], C_EDGE[1], C_EDGE[2], 0.6 * alpha))
             self.ui_rect(sb_x0, thumb_y - thumb_h, sb_x0 + 3, thumb_y,
                          (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], 0.85 * alpha))
+
+    def _ui_arrow(self, x_right, cy, amount, alpha):
+        """Right-pointing submenu arrow built from stacked rects."""
+        col = (C_TEXT[0], C_TEXT[1], C_TEXT[2], alpha)
+        xs = x_right - 11 + amount * 2.0
+        for k in range(3):
+            hh = 3.0 - k
+            self.ui_rect(xs + k * 1.5, cy - hh, xs + k * 1.5 + 1.5, cy + hh, col)
+
+    def _ui_draw_sub_panel(self, geos, depth, wh, alpha, anim_dt):
+        """Draw one nested submenu panel (depth >= 1 in the chain)."""
+        geo = geos[depth]
+        x0, w = geo["x0"], geo["w"]
+        rows = geo["rows"]
+        if not rows:
+            return
+        top, bot = geo["y_top"], geo["y_bot"]
+        self.ui_rect(x0 - 1, bot - 1, x0 + w + 1, top + 1,
+                     (C_EDGE[0], C_EDGE[1], C_EDGE[2], alpha))
+        self.ui_rect(x0, bot, x0 + w, top,
+                     (C_DROP[0], C_DROP[1], C_DROP[2], 0.97 * alpha))
+        path = getattr(self, "ui_path", [])
+        child = path[depth] if len(path) > depth else None
+        for ridx, (item, yt, yb) in enumerate(rows):
+            if item is None:
+                ym = (yt + yb) / 2
+                self.ui_rect(x0 + 8, ym, x0 + w - 8, ym + 1, (C_EDGE[0], C_EDGE[1], C_EDGE[2], alpha))
+                continue
+            hovered = item is child
+            amount = self.ui_tween(("sitem", depth, ridx), 1.0 if hovered else 0.0, anim_dt, 0.18)
+            if amount > 0.01:
+                inset = (1.0 - amount) * 5.0
+                self.ui_rect(x0 + inset, yb + 1, x0 + w - inset, yt - 1,
+                             (C_DROP[0] + (C_HOT[0] - C_DROP[0]) * amount,
+                              C_DROP[1] + (C_HOT[1] - C_DROP[1]) * amount,
+                              C_DROP[2] + (C_HOT[2] - C_DROP[2]) * amount, alpha))
+                if amount > 0.08:
+                    self.ui_rect(x0 + 2, yb + 3, x0 + 4.5, yt - 3,
+                                 (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], amount * alpha))
+            cy = (yt + yb) / 2 + amount * 1.5
+            has_check = item.get("check") is not None
+            if has_check:
+                checked = item["check"]()
+                chk_t = self.ui_tween(("schk", depth, ridx), 1.0 if checked else 0.0, anim_dt, 0.16, overshoot=checked)
+                self.ui_rect(x0 + 7, cy - 5, x0 + 17, cy + 5,
+                             (C_EDGE[0], C_EDGE[1], C_EDGE[2], alpha))
+                if chk_t > 0.01:
+                    r_sz = 3.0 * max(0.0, chk_t)
+                    self.ui_rect(x0 + 12 - r_sz, cy - r_sz, x0 + 12 + r_sz, cy + r_sz,
+                                 (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], min(1.0, chk_t) * alpha))
+            if alpha > 0.35:
+                self.ui_put(self.ui_text(item["label"], C_TEXT), x0 + CHECK_W + amount * 3.5, cy)
+                if item["key"]:
+                    self.ui_put(self.ui_text(item["key"], C_DIM, anchor_x="right"), x0 + w - PAD_X, cy)
+            if item.get("sub"):
+                self._ui_arrow(x0 + w, cy, amount, alpha)
 
     def ui_draw_overlays(self, ww, wh):
         now = time.perf_counter()
