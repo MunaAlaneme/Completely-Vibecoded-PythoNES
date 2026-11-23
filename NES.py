@@ -8826,14 +8826,19 @@ class RetroWindow(arcade.Window if arcade else object):
         arows = [(item, yt + slide_y, yb + slide_y) for item, yt, yb in rows
                  if yb + slide_y >= cur_y_end]
         geos = [{"x0": x0, "w": scale_w, "rows": arows,
-                 "clip_top": cur_y_end, "y_top": wh - MENU_H, "y_bot": vis_bottom}]
+                 "clip_top": cur_y_end, "y_top": wh - MENU_H, "y_bot": vis_bottom, "pop": 1.0}]
         ref_geo, ref_rows = geos[0], arows
-        for parent in path:
+        for idx, parent in enumerate(path):
             rect = next(((yt, yb) for (p, yt, yb) in ref_rows if p is parent), None)
             if rect is None or not parent.get("sub"):
                 break
             yt_p = rect[0]
-            sw = self._ui_sub_width(parent)
+            st = self.ui_hover_t.get(("sub_pop", idx + 1))
+            pop = max(0.0, min(1.0, st[0])) if st is not None else 0.0
+            if pop <= 0.01:
+                break
+            slide = (1.0 - pop) * 6.0
+            sw = self._ui_sub_width(parent) * (0.90 + 0.10 * pop)
             sx0 = ref_geo["x0"] + ref_geo["w"] - 1
             if sx0 + sw > ww:
                 sx0 = ref_geo["x0"] - sw + 1
@@ -8844,10 +8849,11 @@ class RetroWindow(arcade.Window if arcade else object):
             y = top
             for s in parent["sub"]:
                 h = SEP_H if s is None else ITEM_H
-                srows.append((s, y, y - h))
+                srows.append((s, y + slide, y - h + slide))
                 y -= h
             geos.append({"x0": sx0, "w": sw, "rows": srows,
-                         "clip_top": vis_bottom, "y_top": top, "y_bot": bot})
+                         "clip_top": vis_bottom, "y_top": top, "y_bot": bot + slide,
+                         "pop": pop})
             ref_geo, ref_rows = geos[-1], srows
         return geos
 
@@ -9244,6 +9250,24 @@ class RetroWindow(arcade.Window if arcade else object):
 
         # Nested submenu chain (drawn last so deeper panels sit on top)
         if self.ui_open is not None:
+            # Tick per-depth pop tweens; reset when the open chain changes so
+            # newly opened panels pop in instead of appearing fully grown.
+            sig = tuple(id(it) for it in self.ui_path)
+            if sig != getattr(self, "_sub_sig", None):
+                prev = getattr(self, "_sub_sig", ())
+                self._sub_sig = sig
+                n = 0
+                while n < len(sig) and n < len(prev) and sig[n] == prev[n]:
+                    n += 1
+                for d in range(n + 1, 12):
+                    st = self.ui_hover_t.get(("sub_pop", d))
+                    if st is not None:
+                        st[0] = 0.0
+                        st[1] = 0.0
+                        st[2] = 0.0
+                        st[3] = 1.0
+            for d in range(1, len(self.ui_path) + 1):
+                self.ui_tween(("sub_pop", d), 1.0, anim_dt, 0.22)
             geos = self._ui_panel_chain(i, list(getattr(self, "ui_path", [])), wh)
             for depth in range(1, len(geos)):
                 self._ui_draw_sub_panel(geos, depth, wh, alpha, anim_dt)
@@ -9275,6 +9299,9 @@ class RetroWindow(arcade.Window if arcade else object):
         x0, w = geo["x0"], geo["w"]
         rows = geo["rows"]
         if not rows:
+            return
+        alpha = alpha * float(geo.get("pop", 1.0))
+        if alpha <= 0.01:
             return
         top, bot = geo["y_top"], geo["y_bot"]
         self.ui_rect(x0 - 1, bot - 1, x0 + w + 1, top + 1,
@@ -9380,19 +9407,28 @@ class RetroWindow(arcade.Window if arcade else object):
                 self._overlay_max_scroll = max_ov_scroll
                 self.ui_overlay_scroll = max(0.0, min(self.ui_overlay_scroll, max_ov_scroll))
                 self._overlay_row_hits = []
+                mx, my = self.ui_ptr
                 for n, (a, b) in enumerate(rows):
                     y = body_top - n * rh * scale_t + self.ui_overlay_scroll
                     if y < body_bot - 4 or y > body_top + 4:
                         continue
                     self._overlay_row_hits.append((x0 + 8, y - 10, x0 + w - 16, y + 10, a, b))
+                    row_hover = (x0 + 8 <= mx <= x0 + w - 16 and y - 10 <= my <= y + 10)
+                    r_amt = self.ui_tween(("ovrow", a), 1.0 if row_hover else 0.0, anim_dt, 0.16)
+                    if r_amt > 0.01:
+                        ri = (1.0 - r_amt) * 4.0
+                        self.ui_rect(x0 + 6 + ri, y - 9, x0 + w - 10 - ri, y + 9,
+                                     (C_HOT[0], C_HOT[1], C_HOT[2], 0.35 * r_amt * alpha))
                     is_toggle = str(b).lower() in ("on", "off", "true", "false", "yes", "no")
                     if is_toggle:
                         on = str(b).lower() in ("on", "true", "yes")
+                        chk_t = self.ui_tween(("ovchk", a), 1.0 if on else 0.0, anim_dt, 0.16, overshoot=on)
                         self.ui_rect(x0 + 16, y - 6, x0 + 28, y + 6,
                                      (C_EDGE[0], C_EDGE[1], C_EDGE[2], alpha))
-                        if on:
-                            self.ui_rect(x0 + 18, y - 4, x0 + 26, y + 4,
-                                         (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], alpha))
+                        if chk_t > 0.01:
+                            ci = (1.0 - min(1.0, chk_t)) * 4.0
+                            self.ui_rect(x0 + 18 + ci, y - 4 + ci, x0 + 26 - ci, y + 4 - ci,
+                                         (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], min(1.0, chk_t) * alpha))
                         self.ui_put(self.ui_text(a, C_ACCENT), x0 + 36, y)
                     else:
                         self.ui_put(self.ui_text(a, C_ACCENT), x0 + 24, y)
