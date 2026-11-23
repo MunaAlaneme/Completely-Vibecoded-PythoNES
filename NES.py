@@ -6362,6 +6362,8 @@ class GameBoyAdvance:
         self._tm_any = False
         self._pfq = {}
         self._pfq_next = None
+        self._pfq_live = False
+        self._if_live = False
         self._eeprom = (len(self.rom) > 0xB0 and self.rom[0xAC] == 0x46)
         self._eeprom_cmd = 0
         self._eeprom_read_addr = 0
@@ -6501,6 +6503,10 @@ class GameBoyAdvance:
         self._eeprom_cmd = 0
         self._eeprom_read_bits = 0
         self._irq_stack.clear()
+        self._pfq = {}
+        self._pfq_next = None
+        self._pfq_live = False
+        self._if_live = bool(self.io[0x202] | self.io[0x203])
         self._boot_anim_frame = 0
         if getattr(self, "_boot_done_gba", False):
             self._skip_boot_blank_gba()
@@ -6660,6 +6666,8 @@ class GameBoyAdvance:
                 self.io[a] &= ~val
                 return
             self.io[a] = val
+            if a <= 0x209 and a >= 0x200:
+                self._if_live = True
             if 0xA0 <= a <= 0xA3 and len(self.apu.gba_fifo_a) < 2048:
                 self.apu.gba_fifo_a.append(val)
             elif 0xA4 <= a <= 0xA7 and len(self.apu.gba_fifo_b) < 2048:
@@ -6754,6 +6762,7 @@ class GameBoyAdvance:
             # dispatch immediately so games polling right after the DMA are
             # not waiting until the next step.
             self.io[0x202] |= (0x01 << (8 + ch)) & 0xFF
+            self._if_live = True
             self._take_gba_irq()
 
     def _tick_gba_timers(self, cycles):
@@ -6776,6 +6785,19 @@ class GameBoyAdvance:
     def _gba_steps(self, count):
         r = self.r
         step = self.step
+        rg = r[15] >> 24
+        if (rg == 0 or rg >= 0x7F) and not self._irq_stack:
+            io_l = self.io
+            dispatchable = ((self._if_live and (io_l[0x208] & 1)
+                             and ((io_l[0x200] | (io_l[0x201] << 8)) & (io_l[0x202] | (io_l[0x203] << 8)))
+                             and not (self.cpsr & 0x80)))
+            if not dispatchable:
+                # Open-bus/BIOS-zero execution stream: fetch is always ins == 0
+                # (movs r0, r0), pc simply advances, so batch the whole count.
+                r[15] = (r[15] + ((count << 1) if (self.cpsr & 0x20) else (count << 2))) & 0xFFFFFFFF
+                if self._tm_any:
+                    self._tick_gba_timers(count)
+                return True
         if not self._tm_any:
             for _ in range(count):
                 prev_pc = r[15]
@@ -6812,6 +6834,7 @@ class GameBoyAdvance:
         if ch < 2:
             dbase = 0xB0 + (ch + 1) * 12
             ctrl = io[dbase + 10] | (io[dbase + 11] << 8)
+            self._if_live = True
             if (io[dbase + 11] & 0x80) and ((ctrl >> 12) & 3) == 3:
                 dad = io[dbase + 4] | (io[dbase + 5] << 8) | (io[dbase + 6] << 16) | (io[dbase + 7] << 24)
                 if 0x040000A0 <= dad < 0x040000A8 and ((dad - 0x040000A0) >> 2) == ch:
@@ -6892,6 +6915,7 @@ class GameBoyAdvance:
     def _take_gba_irq(self):
         """Dispatch a pending GBA interrupt (IE & IF, IME and IRQ mode permitting)."""
         io = self.io
+        self._if_live = True
         ie = io[0x200] | (io[0x201] << 8)
         iff = io[0x202] | (io[0x203] << 8)
         if not ((io[0x208] & 1) and (ie & iff) and not (self.cpsr & 0x80) and not self._irq_stack):
@@ -6953,6 +6977,7 @@ class GameBoyAdvance:
             if flags & 0x10: self.oam[:] = b"\x00" * len(self.oam)
         elif num in (0x02, 0x04, 0x05):
             self.io[0x202] |= 1
+            self._if_live = True
             self.iwram[0x7FF8] |= 1
         elif num == 0x06:
             num_v = r[0] - 0x100000000 if (r[0] & 0x80000000) else r[0]
@@ -7023,13 +7048,16 @@ class GameBoyAdvance:
             self._return_from_bios_irq()
             return 2
 
-        if self.io[0x202] and not self._irq_stack:
+        if self._if_live and self.io[0x202] and not self._irq_stack:
             self._take_gba_irq()
+            self._if_live = bool(self.io[0x202] | self.io[0x203])
 
-        pcf = (r[15] & ~1) if (self.cpsr & 0x20) else (r[15] & ~3)
-        if pcf != self._pfq_next:
-            self._pfq = {}
-        self._pfq_next = None
+        if self._pfq_live:
+            pcf = (r[15] & ~1) if (self.cpsr & 0x20) else (r[15] & ~3)
+            if pcf != self._pfq_next:
+                self._pfq = {}
+                self._pfq_live = False
+            self._pfq_next = None
         if self.cpsr & 0x20:
             pc = r[15] & ~1
             region = (pc >> 24) & 0xFF
@@ -7066,6 +7094,7 @@ class GameBoyAdvance:
                     nq[na] = ow
                 self._pfq = nq
                 self._pfq_next = (pc + 2) & 0xFFFFFFFF
+                self._pfq_live = True
                 r[15] = (pc + 2) & 0xFFFFFFFF
             elif region >= 15 or region < 2:
                 # BIOS/unmapped bus fill reads as zeros (read16 composes two
@@ -7371,6 +7400,7 @@ class GameBoyAdvance:
                 nq[na] = ow
             self._pfq = nq
             self._pfq_next = (pc + 4) & 0xFFFFFFFF
+            self._pfq_live = True
             r[15] = (pc + 4) & 0xFFFFFFFF
         elif region == 3:
             b = self.iwram
@@ -7388,6 +7418,8 @@ class GameBoyAdvance:
         else:
             ins = self.read32(pc)
         r[15] = (pc + 4) & 0xFFFFFFFF
+        if ins == 0:
+            return 1
         if (ins >> 28) != 0xE and not self._cond_ok((ins >> 28) & 0xF):
             return 1
         op_type = (ins >> 25) & 7
@@ -7616,10 +7648,54 @@ class GameBoyAdvance:
             ad_calc = ((base + off) if (ins & 0x00800000) else (base - off)) & 0xFFFFFFFF
             ad = ad_calc if pre else base
             if ins & 0x00100000:
-                r[rd] = self.read8(ad) if (ins & 0x00400000) else self.read32(ad)
+                if ins & 0x00400000:
+                    rg = ad >> 24
+                    if rg == 3:
+                        r[rd] = self.iwram[ad & 0x7FFF]
+                    elif rg == 2:
+                        r[rd] = self.ewram[ad & 0x3FFFF]
+                    elif 8 <= rg <= 13:
+                        off = ad & 0x1FFFFFF
+                        r[rd] = self.rom[off] if off < len(self.rom) else 0
+                    else:
+                        r[rd] = self.read8(ad)
+                else:
+                    rg = ad >> 24
+                    if rg == 3:
+                        a = ad & 0x7FFC
+                        b = self.iwram
+                        r[rd] = b[a] | (b[a + 1] << 8) | (b[a + 2] << 16) | (b[a + 3] << 24)
+                    elif rg == 2:
+                        a = ad & 0x3FFFC
+                        b = self.ewram
+                        r[rd] = b[a] | (b[a + 1] << 8) | (b[a + 2] << 16) | (b[a + 3] << 24)
+                    elif 8 <= rg <= 13:
+                        off = ad & 0x1FFFFFF
+                        b = self.rom
+                        r[rd] = (b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24)) if off + 3 < len(b) else 0
+                    else:
+                        r[rd] = self.read32(ad)
             else:
-                if ins & 0x00400000: self.write8(ad, r[rd])
-                else: self.write32(ad, r[rd])
+                v = r[rd]
+                rg = ad >> 24
+                if ins & 0x00400000:
+                    if rg == 3:
+                        self.iwram[ad & 0x7FFF] = v & 0xFF
+                    elif rg == 2:
+                        self.ewram[ad & 0x3FFFF] = v & 0xFF
+                    else:
+                        self.write8(ad, v)
+                else:
+                    if rg == 3:
+                        a = ad & 0x7FFC
+                        b = self.iwram
+                        b[a] = v & 0xFF; b[a + 1] = (v >> 8) & 0xFF; b[a + 2] = (v >> 16) & 0xFF; b[a + 3] = (v >> 24) & 0xFF
+                    elif rg == 2:
+                        a = ad & 0x3FFFC
+                        b = self.ewram
+                        b[a] = v & 0xFF; b[a + 1] = (v >> 8) & 0xFF; b[a + 2] = (v >> 16) & 0xFF; b[a + 3] = (v >> 24) & 0xFF
+                    else:
+                        self.write32(ad, v)
             if (ins & 0x00200000) or not pre:
                 r[rn] = ad_calc
         elif op_type == 6 or (op_type == 7 and not (ins & 0x01000000)):
@@ -7879,6 +7955,8 @@ class GameBoyAdvance:
             "gba_fifo_a": bytes(self.apu.gba_fifo_a),
             "gba_fifo_b": bytes(self.apu.gba_fifo_b),
             "tm_cnt": list(self.tm_cnt),
+            "pfq_live": self._pfq_live,
+            "if_live": self._if_live,
         }
 
     def restore_state(self, st):
@@ -7906,6 +7984,10 @@ class GameBoyAdvance:
         self._boot_anim_frame = st.get("boot_anim_frame", self._boot_anim_total)
         if "tm_cnt" in st:
             self.tm_cnt[:] = st["tm_cnt"]
+        self._pfq_live = st.get("pfq_live", False)
+        self._pfq = {}
+        self._pfq_next = None
+        self._if_live = bool(self.io[0x202] | self.io[0x203])
         self._sync_gba_timers()
         if "frame_rgba" in st:
             self.frame_rgba[:] = st["frame_rgba"]
@@ -9674,7 +9756,7 @@ SEP_H = 9
 PAD_X = 12
 CHECK_W = 22
 C_BAR = (0.118, 0.118, 0.137, 1.0)
-C_HOT = (0.235, 0.255, 0.330, 1.0)
+C_HOT = (0.300, 0.335, 0.440, 1.0)
 C_DROP = (0.157, 0.157, 0.180, 1.0)
 C_EDGE = (0.300, 0.300, 0.340, 1.0)
 C_ACCENT = (0.35, 0.65, 1.0, 1.0)
@@ -10786,11 +10868,15 @@ class RetroWindow(arcade.Window if arcade else object):
                              (C_BAR[0] + (C_HOT[0] - C_BAR[0]) * amount,
                               C_BAR[1] + (C_HOT[1] - C_BAR[1]) * amount,
                               C_BAR[2] + (C_HOT[2] - C_BAR[2]) * amount, bar_t))
-                bw = (x1 - x0) * 0.48 * amount
+                bw = (x1 - x0) * 0.62 * amount
                 cx = (x0 + x1) * 0.5
                 self.ui_rect(cx - bw, wh - MENU_H, cx + bw, wh - MENU_H + 2,
                              (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], amount * bar_t))
-            self.ui_put(self.ui_text(name, C_TEXT), x0 + PAD_X, wh - MENU_H / 2 + amount * 1.4 - press_t * 1.1)
+            text_col = (int(C_TEXT[0] + (255 - C_TEXT[0]) * amount * 0.6),
+                        int(C_TEXT[1] + (255 - C_TEXT[1]) * amount * 0.6),
+                        int(C_TEXT[2] + (255 - C_TEXT[2]) * amount * 0.6),
+                        255)
+            self.ui_put(self.ui_text(name, text_col), x0 + PAD_X, wh - MENU_H / 2 + amount * 1.4 - press_t * 1.1)
 
         if self.ui_open is not None:
             self._last_open_menu = self.ui_open
