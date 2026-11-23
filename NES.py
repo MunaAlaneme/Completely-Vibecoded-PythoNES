@@ -1321,10 +1321,9 @@ class NESPPU:
             if draw:
                 self.frame_idx[sl] = self.pal_np[0] & (0x30 if mask & 1 else 0x3F)
             return -1
-        # Overflow is evaluated per scanline: clear it, then set it only if
-        # THIS line has more than 8 sprites. A write to OAM mid-frame rebuilds
-        # the sprite list (and sprite 0's Y) before the test.
-        self.status &= ~0x20
+        # Overflow is sticky: once set it stays until VBlank entry clears it.
+        # Only set it here when THIS line has more than 8 sprites. A write to
+        # OAM mid-frame rebuilds the sprite list (and sprite 0's Y) first.
         if self._oam_dirty:
             self.evaluate_sprites()
             self._oam_dirty = False
@@ -1827,10 +1826,11 @@ class NESAPU:
         self.p1.clock_sweep(); self.p2.clock_sweep()
 
     def run_quarter(self, q, cycles):
-        # A real NTSC frame is 29780.5 CPU cycles. If the caller passes more
-        # (e.g. from a fast-forward or a long catch-up), clamp so the pitch
-        # stays at the real NTSC rate instead of drifting sharp.
-        cycles = min(int(cycles), 8000)
+        # Generate samples for the exact number of cycles passed, including
+        # partial quarters. Clamping here desyncs the audio clock from the
+        # CPU clock and warbles the pitch whenever the frame loop hands over
+        # a non-standard chunk of cycles.
+        cycles = int(cycles)
         levels = self.dmc.run(cycles, self.bus)
         if self.sink is not None:
             self.acc += cycles * self.sr / CPU_HZ
@@ -1892,7 +1892,10 @@ class NES:
         self.cart = NESCartridge(rom_path)
         cls = MAPPERS.get(self.cart.mapper_id)
         if cls is None:
-            raise NotImplementedError(f"Mapper {self.cart.mapper_id} not supported")
+            # Unknown mappers fall back to NROM-style flat mapping instead of
+            # refusing to load; mapper.register writes are then no-ops, which
+            # is enough for many games to boot.
+            cls = Mapper0
         self.mapper = cls(self.cart)
         self.bus = NESBus(self.mapper)
         self.ppu = NESPPU(self.mapper)
@@ -2027,9 +2030,11 @@ class NES:
                 run(341)
             elif sl == 241:
                 run(1)
-                # VBlank entry: set VBlank flag, clear sprite-0 hit and overflow
-                # (bugzmanov NES ebook: "sprite zero hit flag should be erased upon entering VBLANK")
-                ppu.status = (ppu.status & ~0x60) | 0x80
+                # VBlank entry: set VBlank, clear the sticky sprite overflow.
+                # Sprite-0 hit is NOT cleared here; it survives until the
+                # pre-render line so games polling $2002 during VBlank still
+                # see the hit that happened this frame.
+                ppu.status = (ppu.status & ~0x20) | 0x80
                 ppu.s0_done = False
                 if ppu.ctrl & 0x80:
                     cpu.nmi_pending = True
@@ -2432,7 +2437,7 @@ class SNESPPU:
             lut[0, 2] = (self.coldata[2] << 3) | (self.coldata[2] >> 2)
         return lut
 
-    def _render_bg_layer_vec(self, bg, bpp, mode, idx_buf):
+    def _render_bg_layer_vec(self, bg, bpp, mode, idx_buf, y0=0, y1=224):
         vram = self.vram_np
         sc = self.bg_sc[bg]
         map_base = ((sc >> 2) & 0x3F) << 11
@@ -2446,7 +2451,8 @@ class SNESPPU:
         vofs = self.bg_vofs[bg]
         tile_16 = bool(self.bgmode & (0x10 << bg))
 
-        wy = (_SNES_Y224[:, None] + vofs) & 0x3FF
+        rows = _SNES_Y224[y0:y1]
+        wy = (rows[:, None] + vofs) & 0x3FF
         wx = (_SNES_X256[None, :] + hofs) & 0x3FF
 
         if tile_16:
@@ -2531,9 +2537,10 @@ class SNESPPU:
             color_idx = c
 
         mask = c != 0
-        idx_buf[mask] = color_idx[mask]
+        band = idx_buf[y0:y1]
+        band[mask] = color_idx[mask]
 
-    def _render_mode7_vec(self, idx_buf):
+    def _render_mode7_vec(self, idx_buf, y0=0, y1=224):
         vram = self.vram_np
         idx_map = vram[0::2]
         chr_data = vram[1::2]
@@ -2552,7 +2559,7 @@ class SNESPPU:
         dx = _s13(hofs - cx)
         dy = _s13(vofs - cy)
         sx = _SNES_X256[None, :] + dx
-        sy = _SNES_Y224[:, None] + dy
+        sy = _SNES_Y224[y0:y1, None] + dy
         wx = (((a * sx + b * sy) >> 8) + cx) & 0x3FF
         wy = (((c * sx + d * sy) >> 8) + cy) & 0x3FF
         tx = (wx >> 3) & 0x7F
@@ -2562,10 +2569,11 @@ class SNESPPU:
         tile = idx_map[(ty << 7) + tx].astype(np.int32)
         pix = chr_data[(tile << 6) + (fy << 3) + fx]
         mask = pix != 0
-        idx_buf[mask] = pix[mask]
+        band = idx_buf[y0:y1]
+        band[mask] = pix[mask]
 
-    def _render_sprites(self, idx_buf):
-        """Fast vectorized OAM 4bpp sprite renderer."""
+    def _render_sprites(self, idx_buf, y0=0, y1=224):
+        """Fast OAM 4bpp sprite renderer, restricted to rows [y0, y1)."""
         vram = self.vram_np
         oam = self.oam
         base0 = (self.obsel & 7) << 14
@@ -2600,6 +2608,8 @@ class SNESPPU:
             y = (y_raw + 1) & 0xFF
             if y >= 224 and (y + h) <= 256:
                 continue
+            if y >= y1 or y + h <= y0:
+                continue
 
             pal = 128 + (((attr >> 1) & 7) << 4)
             name_table = attr & 1
@@ -2620,7 +2630,7 @@ class SNESPPU:
                     t_base = (chr_base + (t_idx << 5)) & 0xFFFE
                     for fy in range(8):
                         py = (y + (ty << 3) + fy) & 0xFF
-                        if py >= 224:
+                        if py >= 224 or not (y0 <= py < y1):
                             continue
                         row = (7 - fy) if vflip else fy
                         ra = (t_base + (row << 1)) & 0xFFFE
@@ -2639,107 +2649,160 @@ class SNESPPU:
                             dst = idx_buf[py, x_start:x_end]
                             dst[nz] = pal | sl_pix[nz]
 
-    def render_frame(self):
-        """Render active background layers and OAM sprites into 256x224 RGBA framebuffer."""
-        lut = self._get_palette_rgba()
-        idx_buf = np.zeros((224, 256), dtype=np.uint8)
+    def _snapshot_row_state(self):
+        """Render-relevant PPU state snapshot for one scanline (raster effects)."""
+        return (
+            self.bgmode, self.tm, self.ts, self.cgwsel, self.cgadsub, self.inidisp,
+            self.tmw, self.tsw, self.wh0, self.wh1, self.w12sel, self.obsel, self.mosaic,
+            self.m7a, self.m7b, self.m7c, self.m7d, self.m7x, self.m7y,
+            tuple(self.bg_sc), tuple(self.bg_nba), tuple(self.bg_hofs), tuple(self.bg_vofs),
+            tuple(self.coldata), bytes(self.cgram),
+        )
+
+    def _restore_row_state(self, st):
+        (self.bgmode, self.tm, self.ts, self.cgwsel, self.cgadsub, self.inidisp,
+         self.tmw, self.tsw, self.wh0, self.wh1, self.w12sel, self.obsel, self.mosaic,
+         self.m7a, self.m7b, self.m7c, self.m7d, self.m7x, self.m7y) = st[:19]
+        self.bg_sc[:] = st[19]
+        self.bg_nba[:] = st[20]
+        self.bg_hofs[:] = st[21]
+        self.bg_vofs[:] = st[22]
+        self.coldata[:] = st[23]
+        self.cgram[:] = st[24]
+
+    def _render_bgs_band(self, idx_buf, y0, y1):
         mode = self.bgmode & 7
         tm = (self.tm | self.ts) if (self.tm | self.ts) else 0x1F
-
         if mode == 0:
             for bg in (3, 2, 1, 0):
                 if tm & (1 << bg):
-                    self._render_bg_layer_vec(bg, 2, 0, idx_buf)
+                    self._render_bg_layer_vec(bg, 2, 0, idx_buf, y0, y1)
         elif mode == 1:
             if tm & 4:
-                self._render_bg_layer_vec(2, 2, 1, idx_buf)
+                self._render_bg_layer_vec(2, 2, 1, idx_buf, y0, y1)
             if tm & 2:
-                self._render_bg_layer_vec(1, 4, 1, idx_buf)
+                self._render_bg_layer_vec(1, 4, 1, idx_buf, y0, y1)
             if tm & 1:
-                self._render_bg_layer_vec(0, 4, 1, idx_buf)
+                self._render_bg_layer_vec(0, 4, 1, idx_buf, y0, y1)
         elif mode == 2:
             if tm & 2:
-                self._render_bg_layer_vec(1, 4, 2, idx_buf)
+                self._render_bg_layer_vec(1, 4, 2, idx_buf, y0, y1)
             if tm & 1:
-                self._render_bg_layer_vec(0, 4, 2, idx_buf)
+                self._render_bg_layer_vec(0, 4, 2, idx_buf, y0, y1)
         elif mode == 3:
             if tm & 2:
-                self._render_bg_layer_vec(1, 4, 3, idx_buf)
+                self._render_bg_layer_vec(1, 4, 3, idx_buf, y0, y1)
             if tm & 1:
-                self._render_bg_layer_vec(0, 8, 3, idx_buf)
+                self._render_bg_layer_vec(0, 8, 3, idx_buf, y0, y1)
         elif mode == 4:
             if tm & 2:
-                self._render_bg_layer_vec(1, 2, 4, idx_buf)
+                self._render_bg_layer_vec(1, 2, 4, idx_buf, y0, y1)
             if tm & 1:
-                self._render_bg_layer_vec(0, 8, 4, idx_buf)
+                self._render_bg_layer_vec(0, 8, 4, idx_buf, y0, y1)
         elif mode in (5, 6):
             if (mode == 5) and (tm & 2):
-                self._render_bg_layer_vec(1, 2, 5, idx_buf)
+                self._render_bg_layer_vec(1, 2, 5, idx_buf, y0, y1)
             if tm & 1:
-                self._render_bg_layer_vec(0, 4, mode, idx_buf)
+                self._render_bg_layer_vec(0, 4, mode, idx_buf, y0, y1)
         elif mode == 7:
-            self._render_mode7_vec(idx_buf)
+            self._render_mode7_vec(idx_buf, y0, y1)
+        return tm
 
-        if tm & 0x10:
-            self._render_sprites(idx_buf)
+    def render_frame(self, line_states=None):
+        """Render active background layers and OAM sprites into 256x224 RGBA framebuffer.
 
-        # If nothing was drawn (or CGRAM is empty so everything is black), show VRAM tiles
-        frame_black = not idx_buf.any()
-        if not frame_black:
-            # Peek at the palette: if every used index maps to black, treat as empty
-            used = np.unique(idx_buf)
-            if used.size and not lut[used][:, :3].any():
-                frame_black = True
-        if frame_black and self.vram_np.any():
-            nz = np.flatnonzero(self.vram_np)
-            base = int(nz[0] & ~0x1F)
-            vram = self.vram_np
-            ty = np.arange(28, dtype=np.int32)[:, None, None, None]
-            tx = np.arange(32, dtype=np.int32)[None, None, :, None]
-            fy = np.arange(8, dtype=np.int32)[None, :, None, None]
-            t_addr = (base + ((ty * 32 + tx) << 5) + (fy << 1)) & 0xFFFE
-            p0 = vram[t_addr].astype(np.uint16)
-            p1 = vram[t_addr + 1].astype(np.uint16)
-            p2 = vram[(t_addr + 16) & 0xFFFE].astype(np.uint16)
-            p3 = vram[(t_addr + 17) & 0xFFFF].astype(np.uint16)
-            tiles_pix = PIX[(p1 << 8) | p0] | (PIX[(p3 << 8) | p2] << 2)
-            idx_buf[:] = tiles_pix.reshape(224, 256)
+        When per-scanline state snapshots from run_frame are supplied, scanlines
+        are batched into bands of identical render state and each band is drawn
+        with its own snapshot, so mid-frame HDMA/CPU raster effects land on the
+        correct lines instead of being flattened to end-of-frame state.
+        """
+        idx_buf = np.zeros((224, 256), dtype=np.uint8)
+        rendered = np.zeros((224, 256, 4), dtype=np.int16)
+        seq = None
+        if line_states is not None and len(line_states) >= 224 and all(s is not None for s in line_states[:224]):
+            seq = line_states[:224]
+        bands = []
+        y = 0
+        if seq is None:
+            bands.append((0, 224, None))
+        else:
+            while y < 224:
+                st = seq[y]
+                y1 = y + 1
+                while y1 < 224 and seq[y1] == st:
+                    y1 += 1
+                bands.append((y, y1, st))
+                y = y1
 
-        used = np.unique(idx_buf)
-        if used.size > 1 and not lut[used[used > 0], :3].any():
-            for u in used[used > 0]:
-                lut[u] = (((u * 53) & 0xFF) | 0x40, ((u * 97) & 0xFF) | 0x40, ((u * 193) & 0xFF) | 0x40, 255)
+        for y0, y1, st in bands:
+            if st is not None:
+                self._restore_row_state(st)
+            lut = self._get_palette_rgba()
+            tm = self._render_bgs_band(idx_buf, y0, y1)
+            if tm & 0x10:
+                self._render_sprites(idx_buf, y0, y1)
 
-        rendered = lut[idx_buf].astype(np.int16)
-        # Apply SNES CGADSUB ($2131) fixed-color / subscreen color math blending
-        if (self.cgadsub & 0x3F) and any(self.coldata):
-            sub_r = (self.coldata[0] << 3) | (self.coldata[0] >> 2)
-            sub_g = (self.coldata[1] << 3) | (self.coldata[1] >> 2)
-            sub_b = (self.coldata[2] << 3) | (self.coldata[2] >> 2)
-            fg_mask = idx_buf != 0
-            if fg_mask.any():
-                if self.cgadsub & 0x80:  # Subtract
-                    rendered[fg_mask, 0] -= sub_r
-                    rendered[fg_mask, 1] -= sub_g
-                    rendered[fg_mask, 2] -= sub_b
-                else:  # Add
-                    rendered[fg_mask, 0] += sub_r
-                    rendered[fg_mask, 1] += sub_g
-                    rendered[fg_mask, 2] += sub_b
-                if self.cgadsub & 0x40:  # Half-color blend
-                    rendered[fg_mask, :3] >>= 1
-                np.clip(rendered, 0, 255, out=rendered)
+            band_idx = idx_buf[y0:y1]
+            # If nothing was drawn in this band (or CGRAM is empty so everything
+            # is black), show raw VRAM tiles instead
+            frame_black = not band_idx.any()
+            if not frame_black:
+                used = np.unique(band_idx)
+                if used.size and not lut[used][:, :3].any():
+                    frame_black = True
+            if frame_black and self.vram_np.any():
+                nz = np.flatnonzero(self.vram_np)
+                base = int(nz[0] & ~0x1F)
+                vram = self.vram_np
+                ty = np.arange(28, dtype=np.int32)[:, None, None, None]
+                tx = np.arange(32, dtype=np.int32)[None, None, :, None]
+                fy = np.arange(8, dtype=np.int32)[None, :, None, None]
+                t_addr = (base + ((ty * 32 + tx) << 5) + (fy << 1)) & 0xFFFE
+                p0 = vram[t_addr].astype(np.uint16)
+                p1 = vram[t_addr + 1].astype(np.uint16)
+                p2 = vram[(t_addr + 16) & 0xFFFE].astype(np.uint16)
+                p3 = vram[(t_addr + 17) & 0xFFFF].astype(np.uint16)
+                tiles_pix = PIX[(p1 << 8) | p0] | (PIX[(p3 << 8) | p2] << 2)
+                band_idx[:] = tiles_pix.reshape(224, 256)[y0:y1]
 
-        # Apply window clipping mask (TMW $212E + WH0/WH1 $2126/$2127)
-        if self.tmw and self.wh0 <= self.wh1:
-            win1 = (_SNES_X256 >= self.wh0) & (_SNES_X256 <= self.wh1)
-            if (self.w12sel & 0x03) == 0x03 or (self.w12sel & 0x30) == 0x30:
-                rendered[:, win1, :3] = lut[0, :3]
+            used = np.unique(band_idx)
+            if used.size > 1 and not lut[used[used > 0], :3].any():
+                for u in used[used > 0]:
+                    lut[u] = (((u * 53) & 0xFF) | 0x40, ((u * 97) & 0xFF) | 0x40, ((u * 193) & 0xFF) | 0x40, 255)
 
-        bright_val = (self.inidisp & 0x0F) if not (self.inidisp & 0x80) else 15
-        bright = max(1, bright_val) / 15.0
-        if bright < 1.0:
-            rendered[:, :, :3] = (rendered[:, :, :3].astype(np.float32) * bright).astype(np.int16)
+            band = lut[band_idx].astype(np.int16)
+
+            # Apply SNES CGADSUB ($2131) fixed-color / subscreen color math blending
+            if (self.cgadsub & 0x3F) and any(self.coldata):
+                sub_r = (self.coldata[0] << 3) | (self.coldata[0] >> 2)
+                sub_g = (self.coldata[1] << 3) | (self.coldata[1] >> 2)
+                sub_b = (self.coldata[2] << 3) | (self.coldata[2] >> 2)
+                fg_mask = band_idx != 0
+                if fg_mask.any():
+                    if self.cgadsub & 0x80:  # Subtract
+                        band[fg_mask, 0] -= sub_r
+                        band[fg_mask, 1] -= sub_g
+                        band[fg_mask, 2] -= sub_b
+                    else:  # Add
+                        band[fg_mask, 0] += sub_r
+                        band[fg_mask, 1] += sub_g
+                        band[fg_mask, 2] += sub_b
+                    if self.cgadsub & 0x40:  # Half-color blend
+                        band[fg_mask, :3] >>= 1
+                    np.clip(band, 0, 255, out=band)
+
+            # Apply window clipping mask (TMW $212E + WH0/WH1 $2126/$2127)
+            if self.tmw and self.wh0 <= self.wh1:
+                win1 = (_SNES_X256 >= self.wh0) & (_SNES_X256 <= self.wh1)
+                if (self.w12sel & 0x03) == 0x03 or (self.w12sel & 0x30) == 0x30:
+                    band[:, win1, :3] = lut[0, :3]
+
+            bright_val = (self.inidisp & 0x0F) if not (self.inidisp & 0x80) else 15
+            bright = max(1, bright_val) / 15.0
+            if bright < 1.0:
+                band[:, :, :3] = (band[:, :, :3].astype(np.float32) * bright).astype(np.int16)
+            rendered[y0:y1] = band
+
         self.frame_rgba[:] = np.clip(rendered, 0, 255).astype(np.uint8)
 
 
@@ -4253,20 +4316,28 @@ class SNES:
         if buttons & BTN_A:      snes_joy |= 0x0080
         self.bus.joy1 = snes_joy
 
+    def _snapshot_row_state(self):
+        """Render-relevant PPU state for one scanline (HDMA/raster effects)."""
+        return self.ppu._snapshot_row_state()
+
     def run_frame(self, draw=True):
-        """NTSC frame: 262 lines, short scanline at 240, VBlank at 225."""
+        """NTSC frame: 262 lines, short scanline at 240, VBlank at 225.
+
+        HDMA executes in HBlank at the end of the preceding line, and the PPU
+        state for each visible line is snapshotted before the CPU runs that
+        line, so mid-frame register writes (raster effects) land on the next
+        line instead of being lost to an end-of-frame render.
+        """
         cpu, ppu, bus = self.cpu, self.ppu, self.bus
         step = cpu.step
+        line_states = [None] * 224
+        self._line_states = line_states
         for sl in range(262):
             cpl = _PYSNES_SHORT_CPU_CYCLES if sl == _PYSNES_SHORT_SCANLINE else _PYSNES_NORMAL_CPU_CYCLES
             bus._cycles_per_line = cpl
             bus._line_base = cpu.cycles
             ppu.v_latch = sl
             bus._vblank_line = (sl - 225) if sl >= 225 else 999
-
-            # HDMA at the start of each visible line
-            if sl < 224 and bus.hdmaen:
-                bus._run_hdma_scanline(sl)
 
             # VBlank edge a few dots into line 225
             if sl == 225:
@@ -4290,12 +4361,25 @@ class SNES:
             target = cpu.cycles + cpl
             while cpu.cycles < target:
                 if cpu.waiting:
-                    cpu.cycles = target
-                    break
+                    # WAI sleeps, but the clock keeps running so $4212 HBlank
+                    # still sets and pending NMI/IRQ wake the CPU mid-line.
+                    if cpu.nmi_pending or (not cpu.i and bus.timeup):
+                        cpu.waiting = False
+                    else:
+                        cpu.cycles = min(target, cpu.cycles + 4)
+                        continue
                 step()
 
+            # HBlank of this line: run HDMA for the NEXT line, then snapshot
+            # that line's PPU state so the render (below) uses it.
+            nxt = (sl + 1) if sl < 261 else 0
+            if nxt < 224:
+                if bus.hdmaen:
+                    bus._run_hdma_scanline(nxt)
+                line_states[nxt] = self._snapshot_row_state()
+
         if draw:
-            ppu.render_frame()
+            ppu.render_frame(line_states)
         self.apu.run_frame()
         self.frames += 1
 
@@ -4349,6 +4433,7 @@ class GameBoy:
         self.apu.gb_io = self.io
         self.buttons = 0
         self.frames = 0
+        self._hdma_active = False
         self._load_battery()
         self.reset()
         self._skip_boot_blank_gb()
@@ -4496,6 +4581,7 @@ class GameBoy:
             self.io[r] = val
             if r == 0x04:
                 self.io[0x04] = 0
+                self.div_cycles = 0
             elif r == 0x46:  # OAM DMA
                 base = val << 8
                 for i in range(160):
@@ -4507,6 +4593,11 @@ class GameBoy:
                     # H-blank DMA: remaining blocks in low 7 bits, transfer 16 bytes per HBlank.
                     self.io[0x55] = val & 0x7F
                     self._hdma_active = True
+                elif self._hdma_active:
+                    # Writing bit 7 low while an H-blank DMA is running simply
+                    # terminates it; it must not launch a general DMA on top.
+                    self._hdma_active = False
+                    self.io[0x55] = 0xFF
                 else:
                     # General DMA: transfer immediately and report done.
                     src = ((self.io[0x51] << 8) | (self.io[0x52] & 0xF0)) & 0xFFFF
@@ -5004,8 +5095,9 @@ class GameBoy:
                         self.io[0x41] = (self.io[0x41] & 0xFC) | mode
                         if (mode == 0 and (self.io[0x41] & 0x08)) or (mode == 2 and (self.io[0x41] & 0x20)):
                             self.io[0x0F] |= 0x02
-                        # CGB H-blank DMA: 16 bytes per HBlank while active.
-                        if mode == 0 and getattr(self, "_hdma_active", False) and (self.io[0x55] & 0x80) == 0:
+                        # CGB H-blank DMA: 16 bytes per HBlank while active
+                        # and only while the LCD is running (VBlank is mode 1).
+                        if mode == 0 and self._hdma_active and (self.io[0x40] & 0x80):
                             rem = self.io[0x55] & 0x7F
                             src = ((self.io[0x51] << 8) | (self.io[0x52] & 0xF0)) & 0xFFFF
                             dst = (0x8000 | (((self.io[0x53] & 0x1F) << 8) | (self.io[0x54] & 0xF0))) & 0xFFFF
@@ -5340,10 +5432,31 @@ class GameBoyAdvance:
         if not (ctrl & 0x0200):
             self.io[base + 11] &= ~0x80
         if ctrl & 0x4000:
-            # DMA IRQ enable: set corresponding IF bit (0x100 << ch).
+            # DMA IRQ enable: set corresponding IF bit (0x100 << ch), then
+            # dispatch immediately so games polling right after the DMA are
+            # not waiting until the next step.
             self.io[0x202] |= (0x01 << (8 + ch)) & 0xFF
-            if ch >= 0:
-                self.io[0x203] |= (1 << ch) if ch < 4 else 0
+            self._take_gba_irq()
+
+    def _take_gba_irq(self):
+        """Dispatch a pending GBA interrupt (IE & IF, IME and IRQ mode permitting)."""
+        io = self.io
+        ie = io[0x200] | (io[0x201] << 8)
+        iff = io[0x202] | (io[0x203] << 8)
+        if not ((io[0x208] & 1) and (ie & iff) and not (self.cpsr & 0x80) and not self._irq_stack):
+            return
+        r = self.r
+        irq_vec = self.read32(0x03007FFC)
+        if irq_vec >= 0x02000000:
+            self._irq_stack.append((list(r), self.cpsr))
+            self.cpsr |= 0x80  # Disable IRQ while inside handler
+            r[14] = self._BIOS_IRQ_RET
+            if irq_vec & 1:
+                self.cpsr |= 0x20
+                r[15] = irq_vec & ~1
+            else:
+                self.cpsr &= ~0x20
+                r[15] = irq_vec & ~3
 
     def _set_nz(self, val):
         val &= 0xFFFFFFFF
@@ -5652,6 +5765,18 @@ class GameBoyAdvance:
             r[rdhi] = (prod >> 32) & 0xFFFFFFFF
             if ins & 0x00100000:
                 self.cpsr = (self.cpsr & 0x3FFFFFFF) | (0x80000000 if (r[rdhi] & 0x80000000) else 0) | (0x40000000 if prod == 0 else 0)
+        elif op_type == 0 and (ins & 0x0FB00FF0) == 0x01000090:
+            rn, rd, rm = (ins >> 16) & 0xF, (ins >> 12) & 0xF, ins & 0xF
+            ad = r[rn]
+            if ins & 0x00400000:
+                v = self.read8(ad)
+                self.write8(ad, r[rm] & 0xFF)
+                r[rd] = (v | 0xFFFFFF00) if (v & 0x80) else v
+            else:
+                v = self.read32(ad)
+                self.write32(ad, r[rm])
+                r[rd] = v
+            return 2
         elif op_type == 5:
             off = ins & 0xFFFFFF
             if off & 0x800000: off -= 0x1000000
@@ -5790,6 +5915,8 @@ class GameBoyAdvance:
                 else: self.write32(ad, r[rd])
             if (ins & 0x00200000) or not pre:
                 r[rn] = ad_calc
+        elif op_type == 6 or (op_type == 7 and not (ins & 0x01000000)):
+            pass
         return 2
 
     def _render_gba_sprites(self, dispcnt, lut):
@@ -6003,7 +6130,18 @@ class GameBoyAdvance:
         # Brightness blend runs after the fallback so a fade can't hide the tile view
         bldcnt = self.io[0x50] | (self.io[0x51] << 8)
         bld_effect = (bldcnt >> 6) & 3
-        if bld_effect in (2, 3) and (bldcnt & 0x3F):
+        if bld_effect == 1 and (bldcnt & 0x3F):
+            eva = min(16, self.io[0x52] & 0x1F)
+            evb = min(16, self.io[0x53] & 0x1F)
+            if eva > 0 or evb > 0:
+                rgb = self.frame_rgba[:, :, :3].astype(np.int16)
+                backdrop = lut[0, :3].astype(np.int16)
+                fg_mask = (rgb != backdrop).any(axis=-1)
+                if fg_mask.any():
+                    blended = ((rgb * eva + backdrop * evb) >> 4)
+                    rgb[fg_mask] = blended[fg_mask]
+                    self.frame_rgba[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
+        elif bld_effect in (2, 3) and (bldcnt & 0x3F):
             evy = min(16, self.io[0x54] & 0x1F)
             if evy > 0:
                 rgb = self.frame_rgba[:, :, :3].astype(np.int16)
@@ -6083,18 +6221,7 @@ class GameBoyAdvance:
                 io[4] |= 1
                 io[0x202] |= 1
                 self.iwram[0x7FF8] |= 1
-                if (io[0x208] & 1) and (io[0x200] & 1) and not (self.cpsr & 0x80) and not self._irq_stack:
-                    irq_vec = self.read32(0x03007FFC)
-                    if irq_vec >= 0x02000000:
-                        self._irq_stack.append((list(r), self.cpsr))
-                        self.cpsr |= 0x80  # Disable IRQ while inside handler
-                        r[14] = self._BIOS_IRQ_RET
-                        if irq_vec & 1:
-                            self.cpsr |= 0x20
-                            r[15] = irq_vec & ~1
-                        else:
-                            self.cpsr &= ~0x20
-                            r[15] = irq_vec & ~3
+                self._take_gba_irq()
             elif ly < 160:
                 io[4] &= ~1
             for _ in range(260):
@@ -6184,8 +6311,9 @@ class Famicom(NES):
         self.frames = 0
         self.cpu.reset()
         # Seed CHR-RAM and nametable so something is visible even before the CPU runs.
+        # PPU VRAM is 4 KB with nametables at 0x000-0xFFF (mirrored from $2000).
         for i in range(256):
-            self.ppu.vram[0x2000 + i] = (i & 0x0F) | 0x10
+            self.ppu.vram[i] = (i & 0x0F) | 0x10
         self.mapper.chr[:16] = bytes([0xFF, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0xFF,
                                       0x00, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x00])
 
@@ -6577,24 +6705,52 @@ class Nintendo64:
         vi_ctrl = self.vi_regs[0]
         bpp32 = (vi_ctrl & 3) == 3
         need = 320 * 240 * (4 if bpp32 else 2)
+        fb = self.frame_rgba
         if fb_origin + need <= len(self.rdram):
             chunk = self.rdram[fb_origin:fb_origin + need]
-            if any(chunk):
+            if bpp32:
+                arr = np.frombuffer(chunk, dtype=np.uint8).reshape((240, 320, 4))
+                row_any = arr[:, :, :3].any(axis=2)
+            else:
+                px16 = np.frombuffer(chunk, dtype=">u2").reshape((240, 320))
+                row_any = (px16 != 0).any(axis=1)[:, None]
+            if row_any.all():
                 if bpp32:
-                    arr = np.frombuffer(chunk, dtype=np.uint8).reshape((240, 320, 4))
                     self.frame_rgba[:] = arr
                     self.frame_rgba[:, :, 3] = 255
-                    return
                 else:
-                    px16 = np.frombuffer(chunk, dtype=">u2").reshape((240, 320))
                     self.frame_rgba[:, :, 0] = (((px16 >> 11) & 0x1F) << 3) | (((px16 >> 11) & 0x1F) >> 2)
                     self.frame_rgba[:, :, 1] = (((px16 >> 6) & 0x1F) << 3) | (((px16 >> 6) & 0x1F) >> 2)
                     self.frame_rgba[:, :, 2] = (((px16 >> 1) & 0x1F) << 3) | (((px16 >> 1) & 0x1F) >> 2)
                     self.frame_rgba[:, :, 3] = 255
-                    return
+                return
+            if row_any.any():
+                # Partial framebuffer: clear the empty rows, rasterize triangles
+                # into them, then overlay the VI rows the game did write.
+                empty = ~row_any[:, 0] if row_any.shape[1] == 1 else ~row_any.any(axis=1)
+                if bpp32:
+                    vi_rgb = arr
+                else:
+                    vi_rgb = np.empty((240, 320, 3), dtype=np.uint8)
+                    vi_rgb[:, :, 0] = (((px16 >> 11) & 0x1F) << 3) | (((px16 >> 11) & 0x1F) >> 2)
+                    vi_rgb[:, :, 1] = (((px16 >> 6) & 0x1F) << 3) | (((px16 >> 6) & 0x1F) >> 2)
+                    vi_rgb[:, :, 2] = (((px16 >> 1) & 0x1F) << 3) | (((px16 >> 1) & 0x1F) >> 2)
+                fb[empty] = 0
+                self._raster_n64_triangles(fb)
+                if not (fb[empty][:, :, :3].any()):
+                    yy = np.arange(240, dtype=np.int32)[:, None]
+                    grad = np.stack([
+                        np.clip(12 + (yy >> 4), 0, 40).repeat(320, 1),
+                        np.clip(16 + (np.arange(320, dtype=np.int32)[None, :] >> 5), 0, 40).repeat(240, 0),
+                        np.clip(32 + (yy >> 3), 0, 64).repeat(320, 1),
+                    ], axis=2).astype(np.uint8)
+                    still_empty = ~fb[:, :, :3].any(axis=2)
+                    fb[still_empty] = grad[still_empty]
+                fb[:, :, :3][row_any] = vi_rgb[row_any]
+                fb[:, :, 3] = 255
+                return
 
         # 3D fallback: rasterize triangles from RDRAM/DMEM when VI has no image
-        fb = self.frame_rgba
         self._raster_n64_triangles(fb)
         if fb[:, :, :3].any():
             return
@@ -6681,12 +6837,22 @@ class Nintendo64:
         return True
 
     def run_frame(self, draw=True):
+        """Run one full NTSC frame of VR4300 cycles (93.75 MHz / 60 Hz).
+
+        STOPPING after a few thousand instructions left games frozen between
+        vblanks; a real frame is ~1.5M cycles. Each instruction retires 2
+        cycles on average, matching the VR4300's typical throughput.
+        """
         step = self.step
-        for _ in range(4000):
-            prev_pc = self.pc
+        budget = getattr(self, "cycles_per_frame", 1562500)
+        cycles = 0
+        prev = (self.pc, self.next_pc)
+        while cycles < budget:
             step()
-            if self.pc == prev_pc and self.next_pc == prev_pc:
+            cycles += 2
+            if (self.pc, self.next_pc) == prev:
                 break
+            prev = (self.pc, self.next_pc)
         if draw:
             self._render_frame()
         self.apu.run_frame()
@@ -7469,13 +7635,25 @@ class RetroWindow(arcade.Window if arcade else object):
         if i is None:
             return None
         x0 = self.ui_title_x[i][0]
-        if not (x0 <= x < x0 + self.ui_drop_w[i]):
+        drop_w = self.ui_drop_w[i]
+        drop_t = getattr(self, "_drop_anim_t", 1.0)
+        alpha = max(0.0, min(1.0, drop_t))
+        # Mirrors the open animation: rows slide down by slide_y, the panel
+        # grows by scale_w, and rows below the animated top edge are clipped.
+        scale_w = drop_w * (0.94 + 0.06 * alpha)
+        if not (x0 <= x < x0 + scale_w):
             return None
         rows, vis_bottom, _ = self.ui_rows(i, wh)
         if y < vis_bottom or y > wh - MENU_H:
             return None
+        slide_y = (1.0 - alpha) * 6.0
+        max_drop_h = max(80, wh - MENU_H - 8)
+        open_h = (wh - MENU_H) - vis_bottom
+        cur_y_end = (wh - MENU_H - 2) - open_h * alpha
         for item, yt, yb in rows:
-            if item is not None and yb <= y < yt:
+            if item is None or yb + slide_y < cur_y_end:
+                continue
+            if yb + slide_y <= y < yt + slide_y:
                 return item
         return None
 
@@ -7531,7 +7709,8 @@ class RetroWindow(arcade.Window if arcade else object):
     def on_mouse_press(self, x, y, button, modifiers):
         self.ui_ptr = (x, y)
         if self.ui_overlay is not None:
-            # Close button (generous hit area)
+            # Close button (generous hit area); its expanded rect is excluded
+            # from the title-bar drag region so a close click never drags.
             cb = self.ui_modal_close
             if cb and (cb[0] - 6) <= x <= (cb[2] + 6) and (cb[1] - 6) <= y <= (cb[3] + 6):
                 self.ui_overlay = None
@@ -7545,7 +7724,8 @@ class RetroWindow(arcade.Window if arcade else object):
                     return
             # Drag by title bar
             tb = getattr(self, "_overlay_titlebar", None)
-            if tb and tb[0] <= x <= tb[2] and tb[1] <= y <= tb[3]:
+            if (tb and tb[0] <= x <= tb[2] and tb[1] <= y <= tb[3]
+                    and not (cb and (cb[0] - 6) <= x <= (cb[2] + 6) and (cb[1] - 6) <= y <= (cb[3] + 6))):
                 self._overlay_drag = (x - self._overlay_off[0], y - self._overlay_off[1])
                 return
             return
@@ -7754,6 +7934,7 @@ class RetroWindow(arcade.Window if arcade else object):
             self._last_open_menu = self.ui_open
         drop_target = 1.0 if self.ui_open is not None else 0.0
         drop_t = self.ui_tween("dropdown_pop", drop_target, anim_dt, 0.26, overshoot=(drop_target > 0.5))
+        self._drop_anim_t = drop_t
         i = self.ui_open if self.ui_open is not None else getattr(self, "_last_open_menu", None)
         if i is None or drop_t <= 0.01:
             return
@@ -7780,7 +7961,7 @@ class RetroWindow(arcade.Window if arcade else object):
                 ym = (yt + yb) / 2 + slide_y
                 self.ui_rect(x0 + 8, ym, x0 + scale_w - 8, ym + 1, (C_EDGE[0], C_EDGE[1], C_EDGE[2], alpha))
                 continue
-            hovered = (self.ui_open is not None) and (x0 <= px < x0 + w and yb <= py < yt)
+            hovered = (self.ui_open is not None) and (x0 <= px < x0 + scale_w and yb + slide_y <= py < yt + slide_y)
             amount = self.ui_tween(("item", i, row_index), 1.0 if hovered else 0.0, anim_dt, 0.18)
             if amount > 0.01:
                 inset = (1.0 - amount) * 5.0
@@ -7860,8 +8041,9 @@ class RetroWindow(arcade.Window if arcade else object):
 
             if alpha > 0.35:
                 self.ui_put(self.ui_text(title, C_TEXT, 14), x0 + 24, y1 - 24)
-                self._overlay_titlebar = (x0, y1 - 48, x0 + w - 100, y1)
                 bx0, by0, bx1, by1 = x0 + w - 86, y1 - 40, x0 + w - 12, y1 - 12
+                # Title bar stops short of the close button's expanded hit area
+                self._overlay_titlebar = (x0, y1 - 48, bx0 - 8, y1)
                 self.ui_modal_close = (bx0, by0, bx1, by1)
                 mx, my = self.ui_ptr
                 close_hover = (self.ui_overlay is not None) and (bx0 <= mx <= bx1 and by0 <= my <= by1)
@@ -7911,6 +8093,8 @@ class RetroWindow(arcade.Window if arcade else object):
                                  (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], 0.85 * alpha))
         else:
             self.ui_modal_close = None
+            self._overlay_titlebar = None
+            self._overlay_row_hits = []
 
         toast_active = False
         if self.ui_toast is not None:
