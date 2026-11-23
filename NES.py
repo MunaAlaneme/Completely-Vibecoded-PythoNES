@@ -3347,7 +3347,19 @@ class CPU65c816:
     def __init__(self, bus: SNESBus):
         self.bus = bus
         self._hot_ops = None
-        self._fcache = {}
+        self._hot_get = None
+        self._rom = bytes(bus.rom)
+        self._rom_len = len(self._rom)
+        self._is_hirom = bool(bus.hirom)
+        self._is_exhirom = bool(getattr(bus, "exhirom", False))
+        rl = self._rom_len
+        if not self._is_hirom and rl % 0x8000 == 0:
+            self._br_base = [((b & 0x7F) << 15) % rl for b in range(256)]
+        elif self._is_hirom and rl % 0x10000 == 0:
+            hb = 0x400000 if self._is_exhirom else 0
+            self._br_base = [((hb if b < 0x80 else 0) | ((b & 0x3F) << 16)) % rl for b in range(256)]
+        else:
+            self._br_base = None
         self.a = 0          # 16-bit C register (A = low byte, B = high byte)
         self.x = 0          # 16-bit X index
         self.y = 0          # 16-bit Y index
@@ -3385,6 +3397,7 @@ class CPU65c816:
         self.waiting = False
         if self._hot_ops is None:
             self._hot_ops = self._build_hot_ops()
+            self._hot_get = self._hot_ops.get
 
     def get_p(self):
         return (self.c | (self.z << 1) | (self.i << 2) | (self.dec << 3)
@@ -3408,30 +3421,39 @@ class CPU65c816:
 
     def _rom_byte(self, bank, addr):
         """Read a byte that can only come from cartridge ROM (writes never modify
-        these mappings, so the value is constant and cacheable)."""
-        fc = self._fcache
-        key = (bank << 16) | addr
-        v = fc.get(key, -1)
-        if v >= 0:
-            return v
-        v = self.bus.read(bank, addr)
-        if len(fc) > 1000000:
-            fc.clear()
-        fc[key] = v
-        return v
+        these mappings, so the value is constant)."""
+        rom = self._rom
+        if rom is not None and bank <= 0x7D and (addr >= 0x8000 or 0x40 <= bank <= 0x6F):
+            base = self._br_base
+            if base is not None:
+                if self._is_hirom:
+                    return rom[base[bank] | addr]
+                return rom[base[bank] | (addr & 0x7FFF)]
+            if self._is_hirom:
+                if self._is_exhirom and bank < 0x80:
+                    return rom[(0x400000 | ((bank & 0x3F) << 16) | addr) % self._rom_len]
+                return rom[(((bank & 0x3F) << 16) | addr) % self._rom_len]
+            return rom[(((bank & 0x7F) << 15) | (addr & 0x7FFF)) % self._rom_len]
+        return self.bus.read(bank, addr)
 
     def _fetch8(self):
         bank = self.pbr
         pc = self.pc
-        if bank <= 0x7D and (pc >= 0x8000 or 0x40 <= bank <= 0x6F):
-            fc = self._fcache
-            key = (bank << 16) | pc
-            v = fc.get(key, -1)
-            if v < 0:
-                v = self.bus.read(bank, pc)
-                if len(fc) > 1000000:
-                    fc.clear()
-                fc[key] = v
+        rom = self._rom
+        if rom is not None and bank <= 0x7D and (pc >= 0x8000 or 0x40 <= bank <= 0x6F):
+            base = self._br_base
+            if base is not None:
+                if self._is_hirom:
+                    v = rom[base[bank] | pc]
+                else:
+                    v = rom[base[bank] | (pc & 0x7FFF)]
+            elif self._is_hirom:
+                if self._is_exhirom and bank < 0x80:
+                    v = rom[(0x400000 | ((bank & 0x3F) << 16) | pc) % self._rom_len]
+                else:
+                    v = rom[(((bank & 0x3F) << 16) | pc) % self._rom_len]
+            else:
+                v = rom[(((bank & 0x7F) << 15) | (pc & 0x7FFF)) % self._rom_len]
             self.pc = (pc + 1) & 0xFFFF
             return v
         v = self.bus.read(bank, pc)
@@ -3690,10 +3712,15 @@ class CPU65c816:
         off = self._fetch8()
         cyc = 2
         if off & 0x80: off -= 256
-        cond = {
-            0x10: not self.n, 0x30: self.n, 0x50: not self.v, 0x70: self.v,
-            0x80: True, 0x90: not self.c, 0xB0: self.c, 0xD0: not self.z, 0xF0: self.z
-        }[op]
+        if op == 0xD0: cond = not self.z
+        elif op == 0xF0: cond = self.z
+        elif op == 0x80: cond = True
+        elif op == 0x10: cond = not self.n
+        elif op == 0x30: cond = self.n
+        elif op == 0x50: cond = not self.v
+        elif op == 0x70: cond = self.v
+        elif op == 0x90: cond = not self.c
+        else: cond = self.c
         if cond:
             self.pc = (self.pc + off) & 0xFFFF
             cyc = 3
@@ -3845,28 +3872,25 @@ class CPU65c816:
             self.cycles += 2
             return 2
 
-        op = self._fetch8()
-        hot = self._hot_ops
-        if hot is not None:
-            hf = hot.get(op)
-            if hf is not None:
-                return hf()
-        cyc = 2
-
-    def step(self):
-        if self.nmi_pending:
-            self.nmi_pending = False
-            self.trigger_nmi()
-            self.cycles += 8
-            return 8
-        if self.waiting:
-            self.cycles += 2
-            return 2
-
-        op = self._fetch8()
-        hot = self._hot_ops
-        if hot is not None:
-            hf = hot.get(op)
+        pc = self.pc
+        bank = self.pbr
+        rom = self._rom
+        if rom is not None and bank <= 0x7D and (pc >= 0x8000 or 0x40 <= bank <= 0x6F):
+            base = self._br_base
+            if base is not None:
+                if self._is_hirom:
+                    op = rom[base[bank] | pc]
+                else:
+                    op = rom[base[bank] | (pc & 0x7FFF)]
+            elif self._is_hirom:
+                op = rom[(((bank & 0x3F) << 16) | pc) % self._rom_len]
+            else:
+                op = rom[(((bank & 0x7F) << 15) | (pc & 0x7FFF)) % self._rom_len]
+            self.pc = (pc + 1) & 0xFFFF
+        else:
+            op = self._fetch8()
+        if self._hot_ops is not None:
+            hf = self._hot_get(op)
             if hf is not None:
                 return hf()
         cyc = 2
@@ -7809,19 +7833,22 @@ class Nintendo64:
         z = (p0[2] + p1[2] + p2[2]) // 3
         shade = max(40, 255 - z)
         col = (shade, shade // 2, 255 - shade // 3, 255)
-        # Edge function fill (barycentric-ish)
-        def edge(ax, ay, bx, by, cx, cy):
-            return (cx - ax) * (by - ay) - (cy - ay) * (bx - ax)
-        area = edge(p0[0], p0[1], p1[0], p1[1], p2[0], p2[1])
+        # Edge function fill (barycentric-ish), vectorized over the box
+        area = self._edge(p0[0], p0[1], p1[0], p1[1], p2[0], p2[1])
         if area == 0:
             return
-        for y in range(miny, maxy + 1):
-            for x in range(minx, maxx + 1):
-                w0 = edge(p1[0], p1[1], p2[0], p2[1], x, y)
-                w1 = edge(p2[0], p2[1], p0[0], p0[1], x, y)
-                w2 = edge(p0[0], p0[1], p1[0], p1[1], x, y)
-                if (w0 >= 0 and w1 >= 0 and w2 >= 0) or (w0 <= 0 and w1 <= 0 and w2 <= 0):
-                    fb[y, x] = col
+        gx = np.arange(minx, maxx + 1, dtype=np.int32)[None, :]
+        gy = np.arange(miny, maxy + 1, dtype=np.int32)[:, None]
+        e0 = self._edge(p1[0], p1[1], p2[0], p2[1], gx, gy)
+        e1 = self._edge(p2[0], p2[1], p0[0], p0[1], gx, gy)
+        e2 = self._edge(p0[0], p0[1], p1[0], p1[1], gx, gy)
+        mask = ((e0 >= 0) & (e1 >= 0) & (e2 >= 0)) | ((e0 <= 0) & (e1 <= 0) & (e2 <= 0))
+        sub = fb[miny:maxy + 1, minx:maxx + 1]
+        sub[mask] = col
+
+    @staticmethod
+    def _edge(ax, ay, bx, by, cx, cy):
+        return (cx - ax) * (by - ay) - (cy - ay) * (bx - ax)
 
     def _render_frame(self):
         fb_origin = self.vi_regs[1] & 0x007FFFFE
@@ -7971,7 +7998,7 @@ class Nintendo64:
         """
         step = self.step
         budget = getattr(self, "cycles_per_frame", 1562500)
-        cpi = getattr(self, "cycles_per_instruction", 16)
+        cpi = getattr(self, "cycles_per_instruction", 64)
         cycles = 0
         budget += cpi
         while cycles < budget:
