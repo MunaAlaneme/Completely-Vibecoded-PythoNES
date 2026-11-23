@@ -7504,6 +7504,8 @@ class Nintendo64:
         # MIPS VR4300i General Purpose Registers (32 x 64-bit) & CP0 Registers
         self.gpr = [0] * 32
         self.cp0 = [0] * 32
+        self.fpr = [0] * 32
+        self.fcsr = 0
         self.hi = 0
         self.lo = 0
         self.pc = 0xA4000040
@@ -7518,6 +7520,17 @@ class Nintendo64:
         self.ai_regs = [0] * 8
         self.si_regs = [0] * 8
         self.mi_regs = [0, 0x01010101, 0, 0]
+        # SP (RSP) control regs: MEM/DRAM addr, RD/WR len, STATUS, full/busy
+        self.sp_regs = [0, 0, 0, 0, 0x1, 0, 0]   # status bit0 = halted
+        self.dp_regs = [0, 0, 0]                 # start, end, current
+        self.dp_status = 0                       # tracked DP_STATUS bits
+        self._tick_div = 0
+        self._zbuf = np.full((240, 320), 65535, dtype=np.uint16)
+        self._rsp_fb = np.zeros((240, 320, 4), dtype=np.uint8)
+        self.rsp_cmds = 0
+        self.rsp_tris = 0
+        self._irq_active = False
+        self._rsp_reset_state()
 
         self.buttons = 0
         self.frames = 0
@@ -7545,6 +7558,8 @@ class Nintendo64:
     def reset(self):
         self.gpr = [0] * 32
         self.cp0 = [0] * 32
+        self.fpr = [0] * 32
+        self.fcsr = 0
         self.cp0[12] = 0x34000000  # Status: FR=1, CU0=1, CU1=1
         self.cp0[15] = 0x00000B22  # PRId: VR4300
         self.hi = 0
@@ -7563,6 +7578,12 @@ class Nintendo64:
         self.gpr[31] = entry       # RA
         self.pc = entry
         self.next_pc = (entry + 4) & 0xFFFFFFFF
+        self.mi_regs[2] = 0
+        self.sp_regs[4] = 0x0001
+        self._irq_active = False
+        self._rsp_reset_state()
+        self._opmiss_hist = {}
+        self._opmiss_first = []
 
     def set_buttons(self, pad, buttons):
         if pad == 0:
@@ -7571,6 +7592,245 @@ class Nintendo64:
     def _phys(self, vaddr):
         return vaddr & 0x1FFFFFFF
 
+    @staticmethod
+    def _fpack(f):
+        try:
+            return struct.unpack("<I", struct.pack("<f", f))[0]
+        except (OverflowError, ValueError):
+            return 0x7F800000
+
+    @staticmethod
+    def _funpack(u):
+        try:
+            return struct.unpack("<f", struct.pack("<I", u & 0xFFFFFFFF))[0]
+        except (OverflowError, ValueError):
+            return 0.0
+
+    def _mi_update(self):
+        intr = self.mi_regs[2] & self.mi_regs[3] & 0x3F
+        ips = 0
+        if intr & 0x01: ips |= 0x0800      # SP  -> IP3
+        if intr & 0x02: ips |= 0x1000      # SI  -> IP4
+        if intr & 0x04: ips |= 0x2000      # AI  -> IP5
+        if intr & 0x08: ips |= 0x4000      # VI  -> IP6
+        if intr & 0x10: ips |= 0x8000      # PI  -> IP7
+        if intr & 0x20: ips |= 0x0400      # DP  -> IP2
+        cmp_v = self.cp0[11]
+        if cmp_v and ((self.cp0[9] - cmp_v) & 0xFFFFFFFF) < 0x80000000:
+            ips |= 0x8000                  # Count >= Compare -> IP7
+        self.cp0[13] = (self.cp0[13] & ~0x7C00) | ips | (self.cp0[13] & 0x0300)
+
+    def _irq_eval(self):
+        sr = self.cp0[12]
+        self._irq_active = bool(
+            (sr & 0x1) and (sr & 0x6) == 0
+            and self.cp0[13] & (((sr >> 8) & 0xFF) << 8) & 0x7C00)
+
+    def _take_irq(self):
+        self._irq_active = False
+        sr = self.cp0[12]
+        if (sr & 0x1) and (sr & 0x6) == 0:
+            ips = self.cp0[13] & (((sr >> 8) & 0xFF) << 8) & 0x7C00
+            if ips:
+                self.cp0[14] = (self.pc & 0x1FFFFFFF) | 0x80000000
+                self.cp0[13] = self.cp0[13] & ~0x7C
+                self.cp0[12] = sr | 0x2
+                self.pc = 0xBFC00380 if sr & 0x00400000 else 0x80000180
+                self.next_pc = (self.pc + 4) & 0xFFFFFFFF
+                if ips & 0x4000:  # VI vsync is edge-generated: auto-ack
+                    self.mi_regs[2] &= ~0x08
+                    self._mi_update()
+
+    def _tick_count(self, n):
+        cp0 = self.cp0
+        cp0[9] = (cp0[9] + (n >> 1)) & 0xFFFFFFFF
+        self._mi_update()
+        self._irq_eval()
+
+    def _sp_dma_run(self, to_sp):
+        mem = self.sp_regs[0] & 0x1FFF
+        dram = self.sp_regs[1] & 0x1FFFF8
+        ln = ((self.sp_regs[2 if to_sp else 3] & 0xFFF) | 0x1000) + 1
+        dmem = self.sp_dmem if mem < 0x1000 else self.sp_imem
+        off = mem & 0xFFF
+        n = min(ln, len(dmem) - off, len(self.rdram) - dram)
+        if n > 0:
+            if to_sp:
+                dmem[off:off + n] = self.rdram[dram:dram + n]
+            else:
+                self.rdram[dram:dram + n] = dmem[off:off + n]
+
+    def _u32(self, p):
+        if p + 4 <= len(self.rdram):
+            return int.from_bytes(self.rdram[p:p + 4], "big")
+        return 0
+
+    def _rsp_reset_state(self):
+        ident = (1.0, 0.0, 0.0, 0.0,
+                 0.0, 1.0, 0.0, 0.0,
+                 0.0, 0.0, 1.0, 0.0,
+                 0.0, 0.0, 0.0, 1.0)
+        self._rsp_mv = list(ident)
+        self._rsp_proj = list(ident)
+        self._rsp_comb = list(ident)
+        self._rsp_mv_stack = []
+        self._rsp_vbuf = {}
+        self._rsp_dirty = False
+        self._rsp_budget = 20000
+        self._rsp_view_scale = 1.0
+
+    def _s16(self, p):
+        p &= 0x1FFFFFFF
+        if p + 2 <= len(self.rdram):
+            v = (self.rdram[p] << 8) | self.rdram[p + 1]
+            return v - 0x10000 if v & 0x8000 else v
+        return 0
+
+    def _rsp_mvm(self):
+        if self._rsp_dirty:
+            pr = self._rsp_proj
+            mv = self._rsp_mv
+            self._rsp_comb = [sum(pr[i * 4 + k] * mv[k * 4 + j] for k in range(4))
+                              for i in range(4) for j in range(4)]
+            self._rsp_dirty = False
+        return self._rsp_comb
+
+    def _rsp_task_start(self):
+        t = self.sp_dmem
+        ttype = int.from_bytes(t[0:4], "big")
+        if ttype not in (1, 2):
+            return
+        if ttype == 1:
+            data_p = int.from_bytes(t[0x30:0x34], "big") & 0x1FFFFFF8
+            self._rsp_run_dl(data_p)
+        self.sp_regs[4] = (self.sp_regs[4] & ~0x0003) | 0x0003
+        self.mi_regs[2] |= 0x01
+        self._mi_update()
+        self._irq_eval()
+
+    def _rsp_run_dl(self, pc, depth=0):
+        if depth > 8 or pc >= len(self.rdram):
+            return
+        rdram = self.rdram
+        verts = self._rsp_vbuf
+        dl_stack = []
+        for _ in range(self._rsp_budget):
+            if pc + 8 > len(rdram):
+                break
+            self.rsp_cmds += 1
+            w0 = int.from_bytes(rdram[pc:pc + 4], "big")
+            w1 = int.from_bytes(rdram[pc + 4:pc + 8], "big")
+            op = w0 >> 24
+            if op in (0xB8, 0xDF, 0xD7):  # G_ENDDL / G_RET (0xB8 = F3DEX, 0xDF = F3DEX2)
+                if dl_stack:
+                    pc = dl_stack.pop() - 8
+                else:
+                    break
+            elif op == 0x01:  # G_MTX: 16 s16.16 entries, signed int halves then unsigned frac halves
+                addr = w1 & 0x1FFFFFF8
+                params = (w0 >> 16) & 0xFF
+                m = []
+                for i in range(16):
+                    fp = addr + 0x20 + i * 2
+                    frac = (rdram[fp] << 8) | rdram[fp + 1] if fp + 2 <= len(rdram) else 0
+                    m.append(self._s16(addr + i * 2) + frac / 65536.0)
+                if params & 0x01:  # F3DEX: 0x01 projection, 0x02 load, 0x04 push
+                    if params & 0x02:
+                        self._rsp_proj = m
+                    else:
+                        pr = self._rsp_proj
+                        self._rsp_proj = [sum(pr[i * 4 + k] * m[k * 4 + j] for k in range(4))
+                                          for i in range(4) for j in range(4)]
+                else:
+                    if params & 0x04:
+                        self._rsp_mv_stack.append(list(self._rsp_mv))
+                        if len(self._rsp_mv_stack) > 9:
+                            self._rsp_mv_stack.pop(0)
+                    if params & 0x02:
+                        self._rsp_mv = m
+                    else:
+                        mv = self._rsp_mv
+                        self._rsp_mv = [sum(m[i * 4 + k] * mv[k * 4 + j] for k in range(4))
+                                        for i in range(4) for j in range(4)]
+                self._rsp_dirty = True
+            elif op == 0xBD:  # G_POPMTX
+                if self._rsp_mv_stack:
+                    self._rsp_mv = self._rsp_mv_stack.pop()
+                    self._rsp_dirty = True
+            elif op == 0x04:  # G_VTX: s16 x,y,z at 0..5, color at 12..14
+                addr = w1 & 0x1FFFFFF8
+                base = (w0 >> 16) & 0xFF
+                for i in range(min(64, (w0 >> 10) & 0x3F)):
+                    b = addr + i * 16
+                    if b + 16 > len(rdram):
+                        break
+                    verts[base + (i << 1)] = (self._s16(b), self._s16(b + 2), self._s16(b + 4),
+                                              rdram[b + 12], rdram[b + 13], rdram[b + 14])
+            elif op == 0xBF:  # G_TRI1: w1 = 00, i0*2, i1*2, i2*2
+                self._rsp_fill_tri_from_vtx(verts, (w1 >> 16) & 0xFF, (w1 >> 8) & 0xFF, w1 & 0xFF)
+            elif op == 0xB1:  # G_TRI2: first tri in w0, second in w1
+                self._rsp_fill_tri_from_vtx(verts, (w0 >> 16) & 0xFF, (w0 >> 8) & 0xFF, w0 & 0xFF)
+                self._rsp_fill_tri_from_vtx(verts, (w1 >> 16) & 0xFF, (w1 >> 8) & 0xFF, w1 & 0xFF)
+            elif op == 0xB5:  # G_QUAD: two triangles
+                self._rsp_fill_tri_from_vtx(verts, (w0 >> 16) & 0xFF, (w0 >> 8) & 0xFF, w0 & 0xFF)
+                self._rsp_fill_tri_from_vtx(verts, (w1 >> 16) & 0xFF, (w1 >> 8) & 0xFF, w1 & 0xFF)
+            elif op in (0xDE, 0x06):  # G_DL: low flag bit set = branch (no return)
+                if not (w0 & 0x1):
+                    dl_stack.append(pc + 8)
+                pc = (w1 & 0x1FFFFFF8) - 8
+                continue
+            elif op == 0xBE:  # G_CULLDL
+                break
+            pc += 8
+
+    def _rsp_fill_tri_from_vtx(self, verts, i0, i1, i2):
+        v0 = verts.get(i0)
+        v1 = verts.get(i1)
+        v2 = verts.get(i2)
+        if v0 is None or v1 is None or v2 is None:
+            return
+        m = self._rsp_mvm()
+        scale = self._rsp_view_scale
+        pts = []
+        for v in (v0, v1, v2):
+            x, y, z = v[0], v[1], v[2]
+            X = m[0] * x + m[1] * y + m[2] * z + m[3]
+            Y = m[4] * x + m[5] * y + m[6] * z + m[7]
+            Z = m[8] * x + m[9] * y + m[10] * z + m[11]
+            W = m[12] * x + m[13] * y + m[14] * z + m[15]
+            if W <= 0.0:
+                return
+            pts.append((160 + int((X / W) * 160.0 * scale),
+                        120 - int((Y / W) * 120.0 * scale),
+                        max(0.0, min(2.0, (Z / W) * 0.5 + 0.5))))
+        col = ((v0[3] + v1[3] + v2[3]) // 3,
+               (v0[4] + v1[4] + v2[4]) // 3,
+               (v0[5] + v1[5] + v2[5]) // 3)
+        self.rsp_tris += 1
+        self._fill_tri_depth(self._rsp_fb, pts[0], pts[1], pts[2], col)
+
+    def _fill_tri_depth(self, fb, p0, p1, p2, col):
+        xs = (p0[0], p1[0], p2[0])
+        ys = (p0[1], p1[1], p2[1])
+        minx, maxx = max(0, min(xs)), min(319, max(xs))
+        miny, maxy = max(0, min(ys)), min(239, max(ys))
+        if maxx <= minx or maxy <= miny:
+            return
+        zmean = (p0[2] + p1[2] + p2[2]) / 3.0
+        depth = max(1, min(65530, int((1.0 - zmean) * 60000.0)))
+        shade = 0.7 + 0.3 * max(0.0, min(1.0, 1.0 - zmean))
+        fill = (int(col[0] * shade), int(col[1] * shade), int(col[2] * shade), 255)
+        gx = np.arange(minx, maxx + 1, dtype=np.int32)[None, :]
+        gy = np.arange(miny, maxy + 1, dtype=np.int32)[:, None]
+        e0 = self._edge(p1[0], p1[1], p2[0], p2[1], gx, gy)
+        e1 = self._edge(p2[0], p2[1], p0[0], p0[1], gx, gy)
+        e2 = self._edge(p0[0], p0[1], p1[0], p1[1], gx, gy)
+        mask = ((e0 >= 0) & (e1 >= 0) & (e2 >= 0)) | ((e0 <= 0) & (e1 <= 0) & (e2 <= 0))
+        sub = fb[miny:maxy + 1, minx:maxx + 1]
+        zsub = self._zbuf[miny:maxy + 1, minx:maxx + 1]
+        mask &= zsub > depth
+        sub[mask] = fill
+        zsub[mask] = depth
     def read32(self, vaddr):
         p = vaddr & 0x1FFFFFFF
         if p < 0x00800000:
@@ -7582,7 +7842,23 @@ class Nintendo64:
             o = p & 0xFFF
             return int.from_bytes(self.sp_imem[o:o + 4], "big")
         if 0x04300000 <= p < 0x04300010:
-            return self.mi_regs[(p >> 2) & 3]
+            idx = (p >> 2) & 3
+            if idx == 2:  # MI_INTR
+                return self.mi_regs[2]
+            return self.mi_regs[idx]
+        if 0x04040000 <= p < 0x04040020:
+            idx = (p >> 2) & 7
+            if idx == 5:  # SP_DMA_FULL: never full
+                return 0
+            if idx == 6:  # SP_DMA_BUSY: DMA completes instantly
+                return 0
+            return self.sp_regs[idx]
+        if 0x04100000 <= p < 0x04100020:
+            idx = (p >> 2) & 7
+            if idx == 2:  # DP_CURRENT
+                return self.dp_regs[1]
+            if idx == 3:  # DP_STATUS
+                return self.dp_status
         if 0x04400000 <= p < 0x04400040:
             idx = (p >> 2) & 15
             if idx == 4:  # VI_CURRENT half-line toggles so games waiting on VSync advance
@@ -7617,13 +7893,90 @@ class Nintendo64:
             self.sp_imem[o:o + 4] = val.to_bytes(4, "big")
             return
         if 0x04300000 <= p < 0x04300010:
-            self.mi_regs[(p >> 2) & 3] = val
+            idx = (p >> 2) & 3
+            if idx == 0:  # MI_INIT_MODE
+                if val & 0x0200:  # ClrDPInt
+                    self.mi_regs[2] &= ~0x20
+                if val & 0x0100:  # SetDPInt
+                    self.mi_regs[2] |= 0x20
+                self.mi_regs[0] = val
+            elif idx == 3:  # MI_INTR_MASK: clear/set pairs (SP..DP)
+                m = self.mi_regs[3]
+                for bit in range(6):
+                    if val & (1 << (bit * 2)):
+                        m &= ~(1 << bit)
+                    if val & (1 << (bit * 2 + 1)):
+                        m |= (1 << bit)
+                self.mi_regs[3] = m & 0x3F
+            elif idx == 2:  # MI_INTR: ack/clear raised bits
+                self.mi_regs[2] &= ~(val & 0x3F)
+            else:
+                self.mi_regs[idx] = val
+            self._mi_update()
+            return
+        if 0x04040000 <= p < 0x04040020:
+            idx = (p >> 2) & 7
+            if idx <= 3:  # SP_MEM_ADDR / SP_DRAM_ADDR / SP_RD_LEN / SP_WR_LEN
+                self.sp_regs[idx] = val
+                if idx >= 2:  # length write triggers the DMA
+                    self._sp_dma_run(idx == 2)
+            elif idx == 4:  # SP_STATUS set/clear pairs (MAME layout)
+                st = self.sp_regs[4]
+                if val & 0x00000001: st &= ~0x0001   # ClrHalt -> run pending task
+                if val & 0x00000002: st |= 0x0001    # SetHalt
+                if val & 0x00000004: st &= ~0x0002   # ClrBroke
+                if val & 0x00000008: st |= 0x0002    # SetBroke
+                if val & 0x00000010: st &= ~0x0004   # ClrDmaBusy
+                if val & 0x00000020: st |= 0x0004    # SetDmaBusy
+                if val & 0x00000040: st &= ~0x0008; self.mi_regs[2] &= ~0x01
+                if val & 0x00000080: st |= 0x0008;   # SetDmaFull
+                if val & 0x00000100: st &= ~0x0010
+                if val & 0x00000200: st |= 0x0010
+                if val & 0x00000400: st &= ~0x0020
+                if val & 0x00000800: st |= 0x0020
+                if val & 0x00001000: st &= ~0x0040
+                if val & 0x00002000:
+                    st |= 0x0040
+                    self.mi_regs[2] |= 0x01
+                self.sp_regs[4] = st & 0xFFFF
+                if val & 0x00000001:
+                    self._rsp_task_start()
+            return
+        if 0x04100000 <= p < 0x04100020:
+            idx = (p >> 2) & 7
+            if idx == 0:  # DP_START
+                self.dp_regs[0] = val
+            elif idx == 1:  # DP_END: completes a start->end pair instantly
+                self.dp_regs[1] = val
+                self.dp_regs[2] = val
+                self.dp_status &= ~0x00000006  # !start_pending, !pipe_busy... bit2 flush? keep free
+                self.mi_regs[2] |= 0x20        # DP interrupt
+                self._mi_update()
+            elif idx == 3:  # DP_STATUS set/clear pairs
+                st = self.dp_status
+                if val & 0x00000001: st &= ~0x0001   # ClrXbus
+                if val & 0x00000002: st |= 0x0001    # SetXbus
+                if val & 0x00000004: st &= ~0x0002   # ClrFreeze
+                if val & 0x00000008: st |= 0x0002    # SetFreeze
+                if val & 0x00000010: st &= ~0x0004   # ClrFlush
+                if val & 0x00000020: st |= 0x0004    # SetFlush
+                if val & 0x00000800: st &= ~0x0200   # ClrTmemCt?
+                self.dp_status = st
             return
         if 0x04400000 <= p < 0x04400040:
-            self.vi_regs[(p >> 2) & 15] = val
+            idx = (p >> 2) & 15
+            self.vi_regs[idx] = val
+            if idx == 4:  # VI_CURRENT write acks the vsync interrupt
+                self.mi_regs[2] &= ~0x08
+                self._mi_update()
             return
         if 0x04500000 <= p < 0x04500020:
-            self.ai_regs[(p >> 2) & 7] = val
+            idx = (p >> 2) & 7
+            self.ai_regs[idx] = val
+            if idx in (0, 1) and val:  # AI length write: DMA completes, IRQ audio thread
+                self.mi_regs[2] |= 0x04
+                self._mi_update()
+                self._irq_eval()
             return
         if 0x04600000 <= p < 0x04600040:
             idx = (p >> 2) & 15
@@ -7636,6 +7989,11 @@ class Nintendo64:
                 if n > 0:
                     self.rdram[dram_a:dram_a + n] = self.rom[cart_a:cart_a + n]
                 self.mi_regs[2] |= 0x10
+            elif idx == 4:  # PI_STATUS: CLR_INTR acks the PI interrupt
+                if val & 0x2:
+                    self.pi_regs[4] = 0
+                    self.mi_regs[2] &= ~0x10
+            self._mi_update()
             return
         if 0x04800000 <= p < 0x04800020:
             idx = (p >> 2) & 7
@@ -7703,6 +8061,8 @@ class Nintendo64:
         return v - 0x100000000 if (v & 0x80000000) else v
 
     def step(self):
+        if self._irq_active:
+            self._take_irq()
         pc = self.pc
         p = pc & 0x1FFFFFFF
         if p < 0x00800000:
@@ -7761,6 +8121,15 @@ class Nintendo64:
             elif fn == 0x27:  g[rd] = (~(g[rs] | g[rt])) & 0xFFFFFFFF          # NOR
             elif fn == 0x2A:  g[rd] = 1 if self._s32(g[rs]) < self._s32(g[rt]) else 0  # SLT
             elif fn == 0x2B:  g[rd] = 1 if (g[rs] & 0xFFFFFFFF) < (g[rt] & 0xFFFFFFFF) else 0  # SLTU
+            elif fn in (0x2C, 0x2D): g[rd] = (g[rs] + g[rt]) & 0xFFFFFFFF      # DADD / DADDU
+            elif fn in (0x2E, 0x2F): g[rd] = (g[rs] - g[rt]) & 0xFFFFFFFF      # DSUB / DSUBU
+            elif fn == 0x14: g[rd] = (g[rt] << sa) & 0xFFFFFFFF                  # DSLL
+            elif fn == 0x16: g[rd] = (g[rt] & 0xFFFFFFFF) >> sa                  # DSRL
+            elif fn == 0x17: g[rd] = (self._s32(g[rt]) >> sa) & 0xFFFFFFFF       # DSRA
+            elif fn == 0x3C: g[rd] = (g[rt] << (sa + 32)) & 0xFFFFFFFF           # DSLL32
+            elif fn == 0x3E: g[rd] = (g[rt] & 0xFFFFFFFF) >> (sa + 32)           # DSRL32
+            elif fn == 0x3F: g[rd] = (self._s32(g[rt]) >> (sa + 32)) & 0xFFFFFFFF  # DSRA32
+            else: self._opmiss(ins)
         elif op == 0x01:  # REGIMM (BLTZ, BGEZ, BLTZAL, BGEZAL)
             cond = (self._s32(g[rs]) < 0) if ((rt & 1) == 0) else (self._s32(g[rs]) >= 0)
             if rt & 0x10:
@@ -7787,13 +8156,33 @@ class Nintendo64:
         elif op in (0x08, 0x09): g[rt] = (g[rs] + simm) & 0xFFFFFFFF           # ADDI / ADDIU
         elif op == 0x0A:  g[rt] = 1 if self._s32(g[rs]) < simm else 0          # SLTI
         elif op == 0x0B:  g[rt] = 1 if (g[rs] & 0xFFFFFFFF) < (simm & 0xFFFFFFFF) else 0  # SLTIU
+        elif op in (0x18, 0x19):                                               # DADDI / DADDIU
+            g[rt] = ((g[rs] & 0xFFFFFFFFFFFFFFFF) + (simm & 0xFFFFFFFFFFFFFFFF)) & 0xFFFFFFFF
         elif op == 0x0C:  g[rt] = g[rs] & imm                                  # ANDI
         elif op == 0x0D:  g[rt] = g[rs] | imm                                  # ORI
         elif op == 0x0E:  g[rt] = g[rs] ^ imm                                  # XORI
         elif op == 0x0F:  g[rt] = (imm << 16) & 0xFFFFFFFF                     # LUI
         elif op == 0x10:  # COP0
             if rs == 0x00: g[rt] = self.cp0[rd]
-            elif rs == 0x04: self.cp0[rd] = g[rt]
+            elif rs == 0x04:
+                self.cp0[rd] = g[rt]
+                if rd == 9 or rd == 11:
+                    self._mi_update()
+                    self._irq_eval()
+                elif rd == 12:
+                    self._irq_eval()
+                elif rd == 13:
+                    self.cp0[13] = (g[rt] & 0x0300) | (self.cp0[13] & 0x7C00)
+                    self._irq_eval()
+                elif rd == 14 or rd == 30:
+                    self._irq_eval()
+            elif rs == 0x10 and fn == 0x18:  # ERET: ErrorEPC when ERL, else EPC
+                sr0 = self.cp0[12]
+                self.cp0[12] = sr0 & ~0x00000006
+                self.pc = self.cp0[30] if sr0 & 0x4 else self.cp0[14]
+                self.next_pc = (self.pc + 4) & 0xFFFFFFFF
+                self._irq_eval()
+                return
         elif op in (0x14, 0x15, 0x16, 0x17):  # BEQL, BNEL, BLEZL, BGTZL
             cond = (
                 ((g[rs] & 0xFFFFFFFF) == (g[rt] & 0xFFFFFFFF)) if op == 0x14 else
@@ -7810,120 +8199,171 @@ class Nintendo64:
         elif op == 0x23:  g[rt] = self.read32((g[rs] + simm) & 0xFFFFFFFF)
         elif op == 0x24:  g[rt] = self.read8((g[rs] + simm) & 0xFFFFFFFF)
         elif op == 0x25:  g[rt] = self.read16((g[rs] + simm) & 0xFFFFFFFF)
+        elif op == 0x27:  g[rt] = self.read32((g[rs] + simm) & 0xFFFFFFFF)    # LWU
+        elif op == 0x37:                                                       # LD
+            a = (g[rs] + simm) & 0xFFFFFFFF
+            g[rt] = (self.read32(a) << 32) | self.read32((a + 4) & 0xFFFFFFFF)
+        elif op == 0x3F:                                                       # SD
+            a = (g[rs] + simm) & 0xFFFFFFFF
+            v = g[rt] & 0xFFFFFFFFFFFFFFFF
+            self.write32(a, (v >> 32) & 0xFFFFFFFF)
+            self.write32((a + 4) & 0xFFFFFFFF, v & 0xFFFFFFFF)
         elif op == 0x28:  self.write8((g[rs] + simm) & 0xFFFFFFFF, g[rt])
         elif op == 0x29:  self.write16((g[rs] + simm) & 0xFFFFFFFF, g[rt])
         elif op == 0x2B:  self.write32((g[rs] + simm) & 0xFFFFFFFF, g[rt])
+        elif op == 0x31:  self.fpr[rt] = self.read32((g[rs] + simm) & 0xFFFFFFFF)  # LWC1
+        elif op == 0x35:                                                       # LDC1
+            a = (g[rs] + simm) & 0xFFFFFFFF
+            w = self.read32(a)
+            self.fpr[rt & 0x1E] = w & 0xFFFFFFFF
+            w2 = self.read32((a + 4) & 0xFFFFFFFF)
+            self.fpr[(rt & 0x1E) | 1] = w2
+        elif op == 0x39:                                                       # SWC1
+            self.write32((g[rs] + simm) & 0xFFFFFFFF, self.fpr[rt])
+        elif op == 0x3D:                                                       # SDC1
+            a = (g[rs] + simm) & 0xFFFFFFFF
+            self.write32(a, self.fpr[rt & 0x1E])
+            self.write32((a + 4) & 0xFFFFFFFF, self.fpr[(rt & 0x1E) | 1])
+        elif op == 0x2F:                                                       # CACHE
+            pass
+        elif op in (0x14, 0x15):                                               # SDL / SDR
+            a = (g[rs] + simm) & 0xFFFFFFFF
+            v = g[rt]
+            if op == 0x14:                                                     # SDL stores high bytes first
+                off = a & 7
+                for i in range(8 - off):
+                    self.write8((a & ~7) + off + i, (v >> (56 - 8 * i)) & 0xFF)
+            else:                                                              # SDR: low bytes at aligned end
+                off = a & 7
+                for i in range(off + 1):
+                    self.write8((a & ~7) + i, (v >> (56 - 8 * (off - i))) & 0xFF)
+        elif op in (0x1A, 0x1B):                                               # LDL / LDR
+            a = (g[rs] + simm) & 0xFFFFFFFF
+            off = a & 7
+            v = 0
+            if op == 0x1A:                                                     # LDL fills high bytes
+                for i in range(8 - off):
+                    v |= self.read8((a & ~7) + off + i) << (56 - 8 * i)
+            else:                                                              # LDR fills low bytes
+                for i in range(off + 1):
+                    v |= self.read8((a & ~7) + i) << (56 - 8 * (off - i))
+            g[rt] = v & 0xFFFFFFFF
+        elif op == 0x30:  g[rt] = self.read32((g[rs] + simm) & 0xFFFFFFFF)     # LL
+        elif op == 0x38:                                                       # SC
+            self.write32((g[rs] + simm) & 0xFFFFFFFF, g[rt])
+            g[rt] = 1
+        elif op == 0x11:  # COP1 float (single-precision subset)
+            if rs == 0x00:                                                     # MFC1
+                g[rt] = self.fpr[rd]
+            elif rs == 0x04:                                                   # MTC1
+                self.fpr[rd] = g[rt]
+            elif rs == 0x02:                                                   # CFC1
+                g[rt] = self.fcsr if rd == 31 else 0
+            elif rs == 0x06:                                                   # CTC1
+                if rd == 31:
+                    self.fcsr = g[rt]
+            elif rs == 0x08:                                                   # BC1T/F
+                cc = (self.fcsr >> 23) & 1
+                if bool(cc) == bool(rt & 1):
+                    target_next = (cur_next + (simm << 2)) & 0xFFFFFFFF
+            elif rs == 0x10:                                                   # single fmt
+                f1 = self._funpack(self.fpr[rd])
+                f2 = self._funpack(self.fpr[rt])
+                fd = sa
+                if fn == 0x00:   self.fpr[fd] = self._fpack(f1 + f2)
+                elif fn == 0x01: self.fpr[fd] = self._fpack(f1 - f2)
+                elif fn == 0x02: self.fpr[fd] = self._fpack(f1 * f2)
+                elif fn == 0x03: self.fpr[fd] = self._fpack(f1 / f2 if f2 else self._fpack(float("inf")))
+                elif fn == 0x04: self.fpr[fd] = self._fpack(f1 ** 0.5)
+                elif fn == 0x05: self.fpr[fd] = self._fpack(abs(f1))
+                elif fn == 0x06: self.fpr[fd] = self.fpr[rd]
+                elif fn == 0x07: self.fpr[fd] = self._fpack(-f1)
+                elif fn == 0x0C: self.fpr[fd] = self._fpack(int(round(f1)))   # round.w.s
+                elif fn == 0x0D: self.fpr[fd] = self._fpack(int(f1))          # trunc.w.s
+                elif fn == 0x0E: self.fpr[fd] = self._fpack(int(f1) if f1 >= 0 else int(f1) + 1)  # ceil.w.s
+                elif fn == 0x0F: self.fpr[fd] = self._fpack(int(f1) if f1 >= 0 else int(f1) - 1)  # floor.w.s
+                elif fn == 0x20: self.fpr[fd] = self._fpack(float(self._s32(self.fpr[rd])))  # cvt.s.w
+                elif fn == 0x24: self.fpr[fd] = self._fpack(float(int(f1)))    # cvt.w.s
+                elif fn == 0x32: self.fcsr = (self.fcsr & ~0x800000) | (0x800000 if f1 == f2 else 0)
+                elif fn == 0x34: self.fcsr = (self.fcsr & ~0x800000) | (0x800000 if f1 < f2 else 0)
+                elif fn == 0x36: self.fcsr = (self.fcsr & ~0x800000) | (0x800000 if f1 <= f2 else 0)
+                elif fn == 0x30: self.fcsr &= ~0x800000
+                else: self._opmiss(ins)
+            else:
+                self._opmiss(ins)
+        else:
+            self._opmiss(ins)
 
         g[0] = 0
         self.pc = cur_next
         self.next_pc = target_next
 
-    def _raster_n64_triangles(self, fb):
-        """Very small software rasterizer: pull a few 3D points from DMEM/RDRAM
-        and draw filled triangles with simple depth shading. Not a full RDP."""
-        # Prefer DMEM (RSP scratch) then a slice of RDRAM for vertex-like data.
-        src = self.sp_dmem if any(self.sp_dmem) else self.rdram[0x1000:0x2000]
-        if not any(src):
-            return
-        # Interpret groups of 6 bytes as (x,y,z, x,y,z) in 0-255, project to screen.
-        n = min(12, len(src) // 6)
-        if n < 1:
-            return
-        pts = []
-        for i in range(n):
-            b = src[i*6:i*6+6]
-            x, y, z = b[0], b[1], max(1, b[2])
-            # Simple perspective: divide by z, center on screen.
-            sx = int(160 + (x - 128) * 80 / z)
-            sy = int(120 + (y - 128) * 80 / z)
-            pts.append((sx, sy, z))
-        # Draw triangles between consecutive triples.
-        for i in range(0, len(pts) - 2, 3):
-            p0, p1, p2 = pts[i], pts[i+1], pts[i+2]
-            self._fill_tri(fb, p0, p1, p2)
-
-    def _fill_tri(self, fb, p0, p1, p2):
-        # Bounding box clip
-        xs = [p0[0], p1[0], p2[0]]
-        ys = [p0[1], p1[1], p2[1]]
-        minx, maxx = max(0, min(xs)), min(319, max(xs))
-        miny, maxy = max(0, min(ys)), min(239, max(ys))
-        if maxx <= minx or maxy <= miny:
-            return
-        # Depth shade from average z
-        z = (p0[2] + p1[2] + p2[2]) // 3
-        shade = max(40, 255 - z)
-        col = (shade, shade // 2, 255 - shade // 3, 255)
-        # Edge function fill (barycentric-ish), vectorized over the box
-        area = self._edge(p0[0], p0[1], p1[0], p1[1], p2[0], p2[1])
-        if area == 0:
-            return
-        gx = np.arange(minx, maxx + 1, dtype=np.int32)[None, :]
-        gy = np.arange(miny, maxy + 1, dtype=np.int32)[:, None]
-        e0 = self._edge(p1[0], p1[1], p2[0], p2[1], gx, gy)
-        e1 = self._edge(p2[0], p2[1], p0[0], p0[1], gx, gy)
-        e2 = self._edge(p0[0], p0[1], p1[0], p1[1], gx, gy)
-        mask = ((e0 >= 0) & (e1 >= 0) & (e2 >= 0)) | ((e0 <= 0) & (e1 <= 0) & (e2 <= 0))
-        sub = fb[miny:maxy + 1, minx:maxx + 1]
-        sub[mask] = col
+    def _opmiss(self, ins):
+        k = ins >> 26
+        if k == 0:
+            k = 0x40 | (ins & 0x3F)
+        elif k == 0x11:
+            k = 0x80 | (ins & 0x3F)
+        self._opmiss_hist[k] = self._opmiss_hist.get(k, 0) + 1
+        if not self._opmiss_first:
+            self._opmiss_first = [ins]
 
     @staticmethod
     def _edge(ax, ay, bx, by, cx, cy):
         return (cx - ax) * (by - ay) - (cy - ay) * (bx - ax)
 
     def _render_frame(self):
-        fb_origin = self.vi_regs[1] & 0x007FFFFE
-        vi_ctrl = self.vi_regs[0]
-        bpp32 = (vi_ctrl & 3) == 3
-        need = 320 * 240 * (4 if bpp32 else 2)
         fb = self.frame_rgba
+        rsp = self._rsp_fb
+        rsp_has = bool((rsp[:, :, :3] != 0).any())
+        fb_origin = self.vi_regs[1] & 0x007FFFFE
+        bpp32 = (self.vi_regs[0] & 3) == 3
+        need = 320 * 240 * (4 if bpp32 else 2)
+        row_any = None
+        vi_rgb = None
+        arr = None
+        r5 = g5 = b5 = None
         if fb_origin + need <= len(self.rdram):
             chunk = self.rdram[fb_origin:fb_origin + need]
             if bpp32:
                 arr = np.frombuffer(chunk, dtype=np.uint8).reshape((240, 320, 4))
                 row_any = arr[:, :, :3].any(axis=2)
+                vi_rgb = arr[:, :, :3]
             else:
                 px16 = np.frombuffer(chunk, dtype=">u2").reshape((240, 320))
                 row_any = (px16 != 0).any(axis=1)[:, None]
-            if row_any.all():
-                if bpp32:
-                    self.frame_rgba[:] = arr
-                    self.frame_rgba[:, :, 3] = 255
-                else:
-                    self.frame_rgba[:, :, 0] = (((px16 >> 11) & 0x1F) << 3) | (((px16 >> 11) & 0x1F) >> 2)
-                    self.frame_rgba[:, :, 1] = (((px16 >> 6) & 0x1F) << 3) | (((px16 >> 6) & 0x1F) >> 2)
-                    self.frame_rgba[:, :, 2] = (((px16 >> 1) & 0x1F) << 3) | (((px16 >> 1) & 0x1F) >> 2)
-                    self.frame_rgba[:, :, 3] = 255
-                return
-            if row_any.any():
-                # Partial framebuffer: clear the empty rows, rasterize triangles
-                # into them, then overlay the VI rows the game did write.
-                empty = ~row_any[:, 0] if row_any.shape[1] == 1 else ~row_any.any(axis=1)
-                if bpp32:
-                    vi_rgb = arr
-                else:
+                if row_any.any():
+                    r5 = (px16 >> 11) & 0x1F
+                    g5 = (px16 >> 6) & 0x1F
+                    b5 = (px16 >> 1) & 0x1F
                     vi_rgb = np.empty((240, 320, 3), dtype=np.uint8)
-                    vi_rgb[:, :, 0] = (((px16 >> 11) & 0x1F) << 3) | (((px16 >> 11) & 0x1F) >> 2)
-                    vi_rgb[:, :, 1] = (((px16 >> 6) & 0x1F) << 3) | (((px16 >> 6) & 0x1F) >> 2)
-                    vi_rgb[:, :, 2] = (((px16 >> 1) & 0x1F) << 3) | (((px16 >> 1) & 0x1F) >> 2)
-                fb[empty] = 0
-                self._raster_n64_triangles(fb)
-                if not (fb[empty][:, :, :3].any()):
-                    yy = np.arange(240, dtype=np.int32)[:, None]
-                    grad = np.stack([
-                        np.clip(12 + (yy >> 4), 0, 40).repeat(320, 1),
-                        np.clip(16 + (np.arange(320, dtype=np.int32)[None, :] >> 5), 0, 40).repeat(240, 0),
-                        np.clip(32 + (yy >> 3), 0, 64).repeat(320, 1),
-                    ], axis=2).astype(np.uint8)
-                    still_empty = ~fb[:, :, :3].any(axis=2)
-                    fb[still_empty] = grad[still_empty]
+                    vi_rgb[:, :, 0] = (r5 << 3) | (r5 >> 2)
+                    vi_rgb[:, :, 1] = (g5 << 3) | (g5 >> 2)
+                    vi_rgb[:, :, 2] = (b5 << 3) | (b5 >> 2)
+        if rsp_has:
+            fb[:] = rsp
+            fb[:, :, 3] = 255
+            if row_any is not None and row_any.any():
                 fb[:, :, :3][row_any] = vi_rgb[row_any]
+            return
+        if row_any is not None and row_any.all():
+            if bpp32:
+                fb[:] = arr
                 fb[:, :, 3] = 255
-                return
-
-        # 3D fallback: rasterize triangles from RDRAM/DMEM when VI has no image
-        self._raster_n64_triangles(fb)
-        if fb[:, :, :3].any():
+            else:
+                fb[:, :, 0] = (r5 << 3) | (r5 >> 2)
+                fb[:, :, 1] = (g5 << 3) | (g5 >> 2)
+                fb[:, :, 2] = (b5 << 3) | (b5 >> 2)
+                fb[:, :, 3] = 255
+            return
+        if row_any is not None and row_any.any():
+            empt = ~row_any[:, 0] if row_any.shape[1] == 1 else ~row_any.any(axis=1)
+            if bpp32:
+                fb[:, :, :3][row_any] = arr[:, :, :3][row_any]
+            else:
+                fb[:, :, :3][row_any] = vi_rgb[row_any]
+            fb[empt] = (0, 0, 0, 255)
+            fb[:, :, 3] = 255
             return
         # Last resort: paint a dim gradient so the window is never pure black
         yy = np.arange(240, dtype=np.int32)[:, None]
@@ -7932,23 +8372,6 @@ class Nintendo64:
         fb[:, :, 1] = np.clip(16 + (xx >> 5), 0, 40).astype(np.uint8)
         fb[:, :, 2] = np.clip(32 + (yy >> 3), 0, 64).astype(np.uint8)
         fb[:, :, 3] = 255
-        return
-        # Render N64 ROM Header + RSP/RDP Status Banner when homebrew/ROM has not written VI framebuffer yet
-        yy = np.arange(240, dtype=np.int32)[:, None]
-        xx = np.arange(320, dtype=np.int32)[None, :]
-        fb[:, :, 0] = np.clip(18 + (yy >> 3), 0, 255).astype(np.uint8)
-        fb[:, :, 1] = np.clip(24 + (xx >> 4), 0, 255).astype(np.uint8)
-        fb[:, :, 2] = np.clip(58 + (yy >> 2), 0, 255).astype(np.uint8)
-        fb[:, :, 3] = 255
-        # Draw classic 4-color N64 'N' emblem in center
-        cx, cy = 160, 110
-        fb[cy - 28:cy + 28, cx - 28:cx - 16] = (220, 48, 48, 255)   # Red left pillar
-        fb[cy - 28:cy + 28, cx + 16:cx + 28] = (48, 185, 72, 255)   # Green right pillar
-        for d in range(36):
-            px = cx - 18 + d
-            py = cy - 22 + int(d * 1.2)
-            fb[py:py + 10, px:px + 6] = (48, 110, 235, 255)          # Blue diagonal
-        fb[cy + 24:cy + 28, cx - 28:cx + 28] = (242, 200, 42, 255)  # Gold base bar
 
     def capture_state(self):
         return {
@@ -8022,9 +8445,17 @@ class Nintendo64:
         cpi = getattr(self, "cycles_per_instruction", 64)
         cycles = 0
         budget += cpi
+        self._rsp_fb[:] = 0
+        self._zbuf[:] = 65535
         while cycles < budget:
             step()
             cycles += cpi
+            if not (cycles & 0x7FFF):
+                self._tick_count(0x8000)
+        self._tick_count(cycles & 0x7FFF)
+        self.mi_regs[2] |= 0x08        # VI vsync interrupt every frame
+        self._mi_update()
+        self._irq_eval()
         if draw:
             self._render_frame()
         self.apu.run_frame()
