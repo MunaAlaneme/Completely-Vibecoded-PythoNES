@@ -3346,6 +3346,20 @@ class CPU65c816:
 
     def __init__(self, bus: SNESBus):
         self.bus = bus
+        self._hot_ops = None
+        self._hot_get = None
+        self._rom = bytes(bus.rom)
+        self._rom_len = len(self._rom)
+        self._is_hirom = bool(bus.hirom)
+        self._is_exhirom = bool(getattr(bus, "exhirom", False))
+        rl = self._rom_len
+        if not self._is_hirom and rl % 0x8000 == 0:
+            self._br_base = [((b & 0x7F) << 15) % rl for b in range(256)]
+        elif self._is_hirom and rl % 0x10000 == 0:
+            hb = 0x400000 if self._is_exhirom else 0
+            self._br_base = [((hb if b < 0x80 else 0) | ((b & 0x3F) << 16)) % rl for b in range(256)]
+        else:
+            self._br_base = None
         self.a = 0          # 16-bit C register (A = low byte, B = high byte)
         self.x = 0          # 16-bit X index
         self.y = 0          # 16-bit Y index
@@ -3381,6 +3395,9 @@ class CPU65c816:
         self.pc = self.bus.read(0, 0xFFFC) | (self.bus.read(0, 0xFFFD) << 8)
         self.nmi_pending = False
         self.waiting = False
+        if self._hot_ops is None:
+            self._hot_ops = self._build_hot_ops()
+            self._hot_get = self._hot_ops.get
 
     def get_p(self):
         return (self.c | (self.z << 1) | (self.i << 2) | (self.dec << 3)
@@ -3402,9 +3419,45 @@ class CPU65c816:
             self.x &= 0xFF
             self.y &= 0xFF
 
+    def _rom_byte(self, bank, addr):
+        """Read a byte that can only come from cartridge ROM (writes never modify
+        these mappings, so the value is constant)."""
+        rom = self._rom
+        if rom is not None and bank <= 0x7D and (addr >= 0x8000 or 0x40 <= bank <= 0x6F):
+            base = self._br_base
+            if base is not None:
+                if self._is_hirom:
+                    return rom[base[bank] | addr]
+                return rom[base[bank] | (addr & 0x7FFF)]
+            if self._is_hirom:
+                if self._is_exhirom and bank < 0x80:
+                    return rom[(0x400000 | ((bank & 0x3F) << 16) | addr) % self._rom_len]
+                return rom[(((bank & 0x3F) << 16) | addr) % self._rom_len]
+            return rom[(((bank & 0x7F) << 15) | (addr & 0x7FFF)) % self._rom_len]
+        return self.bus.read(bank, addr)
+
     def _fetch8(self):
-        v = self.bus.read(self.pbr, self.pc)
-        self.pc = (self.pc + 1) & 0xFFFF
+        bank = self.pbr
+        pc = self.pc
+        rom = self._rom
+        if rom is not None and bank <= 0x7D and (pc >= 0x8000 or 0x40 <= bank <= 0x6F):
+            base = self._br_base
+            if base is not None:
+                if self._is_hirom:
+                    v = rom[base[bank] | pc]
+                else:
+                    v = rom[base[bank] | (pc & 0x7FFF)]
+            elif self._is_hirom:
+                if self._is_exhirom and bank < 0x80:
+                    v = rom[(0x400000 | ((bank & 0x3F) << 16) | pc) % self._rom_len]
+                else:
+                    v = rom[(((bank & 0x3F) << 16) | pc) % self._rom_len]
+            else:
+                v = rom[(((bank & 0x7F) << 15) | (pc & 0x7FFF)) % self._rom_len]
+            self.pc = (pc + 1) & 0xFFFF
+            return v
+        v = self.bus.read(bank, pc)
+        self.pc = (pc + 1) & 0xFFFF
         return v
 
     def _fetch16(self):
@@ -3419,6 +3472,10 @@ class CPU65c816:
         return hi, (mid << 8) | lo
 
     def _read16(self, bank, addr):
+        if bank <= 0x7D and (addr >= 0x8000 or 0x40 <= bank <= 0x6F):
+            lo = self._rom_byte(bank, addr)
+            hi = self._rom_byte(bank, (addr + 1) & 0xFFFF)
+            return lo | (hi << 8)
         lo = self.bus.read(bank, addr)
         hi = self.bus.read(bank, (addr + 1) & 0xFFFF)
         return lo | (hi << 8)
@@ -3651,6 +3708,175 @@ class CPU65c816:
             full = ((b << 16) + ad + self.x) & 0xFFFFFF
             return full >> 16, full & 0xFFFF
 
+    def _br_any(self, op):
+        off = self._fetch8()
+        cyc = 2
+        if off & 0x80: off -= 256
+        if op == 0xD0: cond = not self.z
+        elif op == 0xF0: cond = self.z
+        elif op == 0x80: cond = True
+        elif op == 0x10: cond = not self.n
+        elif op == 0x30: cond = self.n
+        elif op == 0x50: cond = not self.v
+        elif op == 0x70: cond = self.v
+        elif op == 0x90: cond = not self.c
+        else: cond = self.c
+        if cond:
+            self.pc = (self.pc + off) & 0xFFFF
+            cyc = 3
+        self.cycles += cyc
+        return cyc
+
+    def _build_hot_ops(self):
+        """Fast-path dispatch for the hottest instructions (BIT/branches/LDA/STA/CMP
+        dominate real game code). Handlers mirror the main chain semantics exactly."""
+        nz8 = self._nz8
+        nz16 = self._nz16
+        cmpv = self._cmp_val
+        f8 = self._fetch8
+        f16 = self._fetch16
+        rd = self.bus.read
+        wr = self.bus.write
+        cpu = self
+
+        handlers = {}
+        for bop in (0x10, 0x30, 0x50, 0x70, 0x80, 0x90, 0xB0, 0xD0, 0xF0):
+            def make_br(op=bop):
+                def run():
+                    return cpu._br_any(op)
+                return run
+            handlers[bop] = make_br()
+
+        def cyc2(fn):
+            def run():
+                fn()
+                cpu.cycles += 2
+                return 2
+            return run
+
+        def bit(b, ad):
+            if cpu.m_flag:
+                m = rd(b, ad)
+                cpu.z = int(((cpu.a & 0xFF) & m) == 0)
+                cpu.n = (m >> 7) & 1; cpu.v = (m >> 6) & 1
+            else:
+                m = cpu._read16(b, ad)
+                cpu.z = int((cpu.a & m) == 0)
+                cpu.n = (m >> 15) & 1; cpu.v = (m >> 14) & 1
+
+        handlers[0x2C] = cyc2(lambda: bit(cpu.dbr, f16()))
+        handlers[0x24] = cyc2(lambda: bit(0, (cpu.d + f8()) & 0xFFFF))
+        handlers[0x3C] = cyc2(lambda: bit(cpu.dbr, (f16() + cpu.x) & 0xFFFF))
+        handlers[0x34] = cyc2(lambda: bit(0, (cpu.d + f8() + cpu.x) & 0xFFFF))
+
+        def lda_imm():
+            if cpu.m_flag:
+                m = f8(); cpu.a = (cpu.a & 0xFF00) | m; nz8(m)
+            else:
+                m = f16(); cpu.a = m; nz16(m)
+
+        def lda_dp():
+            ad = (cpu.d + f8()) & 0xFFFF
+            if cpu.m_flag:
+                v = rd(0, ad)
+                cpu.a = (cpu.a & 0xFF00) | v; nz8(v)
+            else:
+                v = cpu._read16(0, ad)
+                cpu.a = v; nz16(v)
+
+        def lda_dpx(): cpu._lda_val(0, (cpu.d + f8() + cpu.x) & 0xFFFF)
+
+        def lda_abs():
+            ad = f16()
+            cpu._lda_val(cpu.dbr, ad)
+
+        def lda_absx():
+            ad = f16()
+            full = ((cpu.dbr << 16) + ad + cpu.x) & 0xFFFFFF
+            cpu._lda_val(full >> 16, full & 0xFFFF)
+
+        def lda_absy():
+            ad = f16()
+            full = ((cpu.dbr << 16) + ad + cpu.y) & 0xFFFFFF
+            cpu._lda_val(full >> 16, full & 0xFFFF)
+
+        def sta_dp():
+            ad = (cpu.d + f8()) & 0xFFFF
+            if cpu.m_flag:
+                wr(0, ad, cpu.a & 0xFF)
+            else:
+                cpu._write16(0, ad, cpu.a)
+
+        def sta_dpx(): cpu._sta_val(0, (cpu.d + f8() + cpu.x) & 0xFFFF)
+
+        def sta_abs():
+            ad = f16()
+            cpu._sta_val(cpu.dbr, ad)
+
+        def sta_absx():
+            ad = f16()
+            full = ((cpu.dbr << 16) + ad + cpu.x) & 0xFFFFFF
+            cpu._sta_val(full >> 16, full & 0xFFFF)
+
+        def sta_absy():
+            ad = f16()
+            full = ((cpu.dbr << 16) + ad + cpu.y) & 0xFFFFFF
+            cpu._sta_val(full >> 16, full & 0xFFFF)
+
+        def cmp_imm(): cmpv(cpu.a, f8() if cpu.m_flag else f16(), bool(cpu.m_flag))
+        def cmp_dp():
+            ad = (cpu.d + f8()) & 0xFFFF
+            cmpv(cpu.a, rd(0, ad) if cpu.m_flag else cpu._read16(0, ad), bool(cpu.m_flag))
+
+        def cmp_abs():
+            ad = f16()
+            cmpv(cpu.a, rd(cpu.dbr, ad) if cpu.m_flag else cpu._read16(cpu.dbr, ad), bool(cpu.m_flag))
+
+        def nop():
+            cpu.cycles += 2
+            return 2
+
+        def inc_a():
+            if cpu.m_flag:
+                v = ((cpu.a & 0xFF) + 1) & 0xFF; cpu.a = (cpu.a & 0xFF00) | v; nz8(v)
+            else:
+                cpu.a = (cpu.a + 1) & 0xFFFF; nz16(cpu.a)
+            cpu.cycles += 2
+            return 2
+
+        def dec_a():
+            if cpu.m_flag:
+                v = ((cpu.a & 0xFF) - 1) & 0xFF; cpu.a = (cpu.a & 0xFF00) | v; nz8(v)
+            else:
+                cpu.a = (cpu.a - 1) & 0xFFFF; nz16(cpu.a)
+            cpu.cycles += 2
+            return 2
+
+        def jmp_abs():
+            cpu.pc = f16()
+            cpu.cycles += 2
+            return 2
+
+        handlers[0xA9] = cyc2(lda_imm)
+        handlers[0xA5] = cyc2(lda_dp)
+        handlers[0xB5] = cyc2(lda_dpx)
+        handlers[0xAD] = cyc2(lda_abs)
+        handlers[0xBD] = cyc2(lda_absx)
+        handlers[0xB9] = cyc2(lda_absy)
+        handlers[0x85] = cyc2(sta_dp)
+        handlers[0x95] = cyc2(sta_dpx)
+        handlers[0x8D] = cyc2(sta_abs)
+        handlers[0x9D] = cyc2(sta_absx)
+        handlers[0x99] = cyc2(sta_absy)
+        handlers[0xC9] = cyc2(cmp_imm)
+        handlers[0xC5] = cyc2(cmp_dp)
+        handlers[0xCD] = cyc2(cmp_abs)
+        handlers[0xEA] = nop
+        handlers[0x1A] = inc_a
+        handlers[0x3A] = dec_a
+        handlers[0x4C] = jmp_abs
+        return handlers
+
     def step(self):
         if self.nmi_pending:
             self.nmi_pending = False
@@ -3661,7 +3887,27 @@ class CPU65c816:
             self.cycles += 2
             return 2
 
-        op = self._fetch8()
+        pc = self.pc
+        bank = self.pbr
+        rom = self._rom
+        if rom is not None and bank <= 0x7D and (pc >= 0x8000 or 0x40 <= bank <= 0x6F):
+            base = self._br_base
+            if base is not None:
+                if self._is_hirom:
+                    op = rom[base[bank] | pc]
+                else:
+                    op = rom[base[bank] | (pc & 0x7FFF)]
+            elif self._is_hirom:
+                op = rom[(((bank & 0x3F) << 16) | pc) % self._rom_len]
+            else:
+                op = rom[(((bank & 0x7F) << 15) | (pc & 0x7FFF)) % self._rom_len]
+            self.pc = (pc + 1) & 0xFFFF
+        else:
+            op = self._fetch8()
+        if self._hot_ops is not None:
+            hf = self._hot_get(op)
+            if hf is not None:
+                return hf()
         cyc = 2
 
         # Flag & Mode Instructions
@@ -5172,6 +5418,10 @@ class GBPPU:
     def __init__(self, gb):
         self.gb = gb
         self.cgb = gb.cgb
+        self._bg_lut_cache = None
+        self._bg_lut_ver = -1
+        self._obj_lut_cache = None
+        self._obj_lut_ver = -1
         self.ly = 0
         self.mode = 2
         self.line_cyc = 0
@@ -5290,6 +5540,10 @@ class GBPPU:
 
     def _cgb_bg_lut(self):
         gb = self.gb
+        ver = gb._pal_ver
+        lut = self._bg_lut_cache
+        if lut is not None and self._bg_lut_ver == ver:
+            return lut  # palettes unchanged since last line
         cg_bg = np.frombuffer(gb.bg_pal, dtype="<u2")
         lut = np.empty((256, 4), dtype=np.uint8)
         r5 = ((cg_bg & 0x1F) << 3) | ((cg_bg & 0x1F) >> 2)
@@ -5301,10 +5555,16 @@ class GBPPU:
             lut[sl, 1] = g5[sl]
             lut[sl, 2] = b5[sl]
             lut[sl, 3] = 255
+        self._bg_lut_cache = lut
+        self._bg_lut_ver = ver
         return lut
 
     def _cgb_obj_lut(self):
         gb = self.gb
+        ver = gb._pal_ver
+        lut = self._obj_lut_cache
+        if lut is not None and self._obj_lut_ver == ver:
+            return lut
         cg_ob = np.frombuffer(gb.obj_pal, dtype="<u2")
         r5 = ((cg_ob & 0x1F) << 3) | ((cg_ob & 0x1F) >> 2)
         g5 = (((cg_ob >> 5) & 0x1F) << 3) | (((cg_ob >> 5) & 0x1F) >> 2)
@@ -5316,6 +5576,8 @@ class GBPPU:
             lut[sl, 1] = g5[sl]
             lut[sl, 2] = b5[sl]
             lut[sl, 3] = 255
+        self._obj_lut_cache = lut
+        self._obj_lut_ver = ver
         return lut
 
     def _render_line(self, io):
@@ -5473,6 +5735,7 @@ class GameBoy:
         self.io = bytearray(128)
         self.bg_pal = bytearray(64)
         self.obj_pal = bytearray(64)
+        self._pal_ver = 0
         self.bcpd_idx = 0
         self.ocpd_idx = 0
         self.frame_rgba = np.zeros((144, 160, 4), dtype=np.uint8)
@@ -5660,12 +5923,14 @@ class GameBoy:
                 self.bcpd_idx = val
             elif r == 0x69:
                 self.bg_pal[self.bcpd_idx & 0x3F] = val
+                self._pal_ver += 1
                 if self.bcpd_idx & 0x80:
                     self.bcpd_idx = 0x80 | ((self.bcpd_idx + 1) & 0x3F)
             elif r == 0x6A:
                 self.ocpd_idx = val
             elif r == 0x6B:
                 self.obj_pal[self.ocpd_idx & 0x3F] = val
+                self._pal_ver += 1
                 if self.ocpd_idx & 0x80:
                     self.ocpd_idx = 0x80 | ((self.ocpd_idx + 1) & 0x3F)
             elif r == 0x70 and self.cgb:
@@ -5804,6 +6069,7 @@ class GameBoy:
         return st
 
     def restore_state(self, st):
+        self._pal_ver += 1
         cpu = st.get("cpu2")
         if cpu:
             self.cpu.r8 = list(cpu["r8"])
@@ -5917,17 +6183,23 @@ class GameBoy:
         step = self.cpu.step
         apu_tick = self.apu.tick
         ppu_tick = ppu.tick
+        timer_tick = self._tick_timer
         ran = 0
-        rem = 0
+        rem = getattr(self, "_speed_rem", 0)
+        # Batch PPU/APU/timer ticks: checking every ~24 T-cycles (~2-6
+        # instructions) instead of after every instruction removes several
+        # Python calls per step with sub-scanline-accurate results.
+        thresh = 24 * speed
         while ran < budget:
             c = step()
             ran += c
             rem += c
-            eff = rem // speed
-            rem -= eff * speed
-            if eff:
+            if rem >= thresh:
+                eff = rem // speed
+                raw = eff * speed
+                rem -= raw
                 apu_tick(eff, io)
-                self._tick_timer(c)
+                timer_tick(raw)
                 ppu_tick(eff)
         self._speed_rem = rem
         if not (io[0x40] & 0x80):
@@ -6158,11 +6430,76 @@ class GameBoyAdvance:
 
     def read16(self, addr):
         addr &= ~1
+        region = (addr >> 24) & 0xFF
+        if region == 2:
+            a = addr & 0x3FFFF; b = self.ewram
+            return b[a] | (b[a + 1] << 8)
+        if region == 3:
+            a = addr & 0x7FFF; b = self.iwram
+            return b[a] | (b[a + 1] << 8)
+        if region == 5:
+            b = self.pram
+            return b[addr & 1023] | (b[(addr + 1) & 1023] << 8)
+        if region == 6:
+            b = self.vram
+            a = addr & 0x1FFFF
+            if a >= 0x18000:
+                a = 0x10000 | (a & 0x7FFF)
+            a2 = (a + 1) & 0x1FFFF
+            if a2 >= 0x18000:
+                a2 = 0x10000 | (a2 & 0x7FFF)
+            return b[a] | (b[a2] << 8)
+        if region == 7:
+            b = self.oam
+            return b[addr & 1023] | (b[(addr + 1) & 1023] << 8)
+        if 8 <= region <= 13:
+            a = addr & 0x1FFFFFF
+            rom = self.rom
+            if a + 1 < len(rom):
+                return rom[a] | (rom[a + 1] << 8)
+            return 0
         return self.read8(addr) | (self.read8(addr + 1) << 8)
 
     def read32(self, addr):
         addr &= ~3
-        return self.read8(addr) | (self.read8(addr + 1) << 8) | (self.read8(addr + 2) << 16) | (self.read8(addr + 3) << 24)
+        region = (addr >> 24) & 0xFF
+        if region == 2:
+            a = addr & 0x3FFFF; b = self.ewram
+            return b[a] | (b[a + 1] << 8) | (b[a + 2] << 16) | (b[a + 3] << 24)
+        if region == 3:
+            a = addr & 0x7FFF; b = self.iwram
+            return b[a] | (b[a + 1] << 8) | (b[a + 2] << 16) | (b[a + 3] << 24)
+        if region == 5:
+            b = self.pram
+            return (b[addr & 1023] | (b[(addr + 1) & 1023] << 8)
+                    | (b[(addr + 2) & 1023] << 16) | (b[(addr + 3) & 1023] << 24))
+        if region == 6:
+            b = self.vram
+            a0 = addr & 0x1FFFF
+            if a0 >= 0x18000:
+                a0 = 0x10000 | (a0 & 0x7FFF)
+            a1 = a0 + 1
+            if a1 >= 0x18000:
+                a1 = 0x10000 | (a1 & 0x7FFF)
+            a2 = a0 + 2
+            if a2 >= 0x18000:
+                a2 = 0x10000 | (a2 & 0x7FFF)
+            a3 = a0 + 3
+            if a3 >= 0x18000:
+                a3 = 0x10000 | (a3 & 0x7FFF)
+            return b[a0] | (b[a1] << 8) | (b[a2] << 16) | (b[a3] << 24)
+        if region == 7:
+            b = self.oam
+            return (b[addr & 1023] | (b[(addr + 1) & 1023] << 8)
+                    | (b[(addr + 2) & 1023] << 16) | (b[(addr + 3) & 1023] << 24))
+        if 8 <= region <= 13:
+            a = addr & 0x1FFFFFF
+            rom = self.rom
+            if a + 3 < len(rom):
+                return rom[a] | (rom[a + 1] << 8) | (rom[a + 2] << 16) | (rom[a + 3] << 24)
+            return 0
+        return (self.read8(addr) | (self.read8(addr + 1) << 8)
+                | (self.read8(addr + 2) << 16) | (self.read8(addr + 3) << 24))
 
     def write8(self, addr, val):
         val &= 0xFF
@@ -6256,13 +6593,32 @@ class GameBoyAdvance:
         val &= 0xFFFFFFFF
         self.cpsr = (self.cpsr & 0x3FFFFFFF) | (0x80000000 if (val & 0x80000000) else 0) | (0x40000000 if val == 0 else 0)
 
+    _COND_TAB = None  # built lazily at class level
+
+    @classmethod
+    def _build_cond_tab(cls):
+        tab = bytearray(16 * 16)
+        for cond in range(16):
+            for fi in range(16):
+                n = (fi >> 3) & 1
+                z = (fi >> 2) & 1
+                c = (fi >> 1) & 1
+                v = fi & 1
+                nb, zb, cb, vb = bool(n), bool(z), bool(c), bool(v)
+                ok = (
+                    zb, not zb, cb, not cb, nb, not nb, vb, not vb,
+                    cb and not zb, not cb or zb, nb == vb, nb != vb,
+                    (not zb) and (nb == vb), zb or (nb != vb), True, False
+                )[cond]
+                tab[(cond << 4) | fi] = 1 if ok else 0
+        return bytes(tab)
+
     def _cond_ok(self, cond):
         if cond == 0xE: return True
-        n = bool(self.cpsr & 0x80000000)
-        z = bool(self.cpsr & 0x40000000)
-        c = bool(self.cpsr & 0x20000000)
-        v = bool(self.cpsr & 0x10000000)
-        return (z, not z, c, not c, n, not n, v, not v, c and not z, not c or z, n == v, n != v, not z and (n == v), z or (n != v), True, False)[cond]
+        tab = self._COND_TAB
+        if tab is None:
+            tab = self._COND_TAB = self._build_cond_tab()
+        return tab[(cond << 4) | ((self.cpsr >> 28) & 0xF)]
 
     def _hle_swi(self, num):
         """High-Level Emulation of GBA BIOS SWI calls used to copy/decompress VRAM & palettes."""
@@ -7213,13 +7569,10 @@ class Nintendo64:
             self.buttons = buttons
 
     def _phys(self, vaddr):
-        vaddr &= 0xFFFFFFFF
-        if 0x80000000 <= vaddr <= 0xBFFFFFFF:
-            return vaddr & 0x1FFFFFFF
         return vaddr & 0x1FFFFFFF
 
     def read32(self, vaddr):
-        p = self._phys(vaddr)
+        p = vaddr & 0x1FFFFFFF
         if p < 0x00800000:
             return int.from_bytes(self.rdram[p:p + 4], "big")
         if 0x04000000 <= p < 0x04001000:
@@ -7251,7 +7604,7 @@ class Nintendo64:
 
     def write32(self, vaddr, val):
         val &= 0xFFFFFFFF
-        p = self._phys(vaddr)
+        p = vaddr & 0x1FFFFFFF
         if p < 0x00800000:
             self.rdram[p:p + 4] = val.to_bytes(4, "big")
             return
@@ -7311,22 +7664,34 @@ class Nintendo64:
             self.pif_ram[o:o + 4] = val.to_bytes(4, "big")
 
     def read8(self, vaddr):
+        p = vaddr & 0x1FFFFFFF
+        if p < 0x00800000:
+            return self.rdram[p]
         w = self.read32(vaddr & ~3)
-        shift = (3 - (vaddr & 3)) * 8
-        return (w >> shift) & 0xFF
+        return (w >> ((3 - (vaddr & 3)) * 8)) & 0xFF
 
     def write8(self, vaddr, val):
+        p = vaddr & 0x1FFFFFFF
+        if p < 0x00800000:
+            self.rdram[p] = val & 0xFF
+            return
         aligned = vaddr & ~3
         shift = (3 - (vaddr & 3)) * 8
         w = self.read32(aligned) & ~(0xFF << shift)
         self.write32(aligned, w | ((val & 0xFF) << shift))
 
     def read16(self, vaddr):
+        p = vaddr & 0x1FFFFFFE
+        if p < 0x00800000:
+            return int.from_bytes(self.rdram[p:p + 2], "big")
         w = self.read32(vaddr & ~3)
-        shift = (2 - (vaddr & 2)) * 8
-        return (w >> shift) & 0xFFFF
+        return (w >> ((2 - (vaddr & 2)) * 8)) & 0xFFFF
 
     def write16(self, vaddr, val):
+        p = vaddr & 0x1FFFFFFE
+        if p < 0x00800000:
+            self.rdram[p:p + 2] = (val & 0xFFFF).to_bytes(2, "big")
+            return
         aligned = vaddr & ~3
         shift = (2 - (vaddr & 2)) * 8
         w = self.read32(aligned) & ~(0xFFFF << shift)
@@ -7339,7 +7704,16 @@ class Nintendo64:
 
     def step(self):
         pc = self.pc
-        ins = self.read32(pc)
+        p = pc & 0x1FFFFFFF
+        if p < 0x00800000:
+            b = self.rdram
+            ins = (b[p] << 24) | (b[p + 1] << 16) | (b[p + 2] << 8) | b[p + 3]
+        elif 0x10000000 <= p < 0x1FC00000:
+            off = p - 0x10000000
+            rom = self.rom
+            ins = (rom[off] << 24) | (rom[off + 1] << 16) | (rom[off + 2] << 8) | rom[off + 3] if off + 4 <= len(rom) else 0
+        else:
+            ins = self.read32(pc)
         cur_next = self.next_pc
         target_next = (cur_next + 4) & 0xFFFFFFFF
 
@@ -7480,19 +7854,22 @@ class Nintendo64:
         z = (p0[2] + p1[2] + p2[2]) // 3
         shade = max(40, 255 - z)
         col = (shade, shade // 2, 255 - shade // 3, 255)
-        # Edge function fill (barycentric-ish)
-        def edge(ax, ay, bx, by, cx, cy):
-            return (cx - ax) * (by - ay) - (cy - ay) * (bx - ax)
-        area = edge(p0[0], p0[1], p1[0], p1[1], p2[0], p2[1])
+        # Edge function fill (barycentric-ish), vectorized over the box
+        area = self._edge(p0[0], p0[1], p1[0], p1[1], p2[0], p2[1])
         if area == 0:
             return
-        for y in range(miny, maxy + 1):
-            for x in range(minx, maxx + 1):
-                w0 = edge(p1[0], p1[1], p2[0], p2[1], x, y)
-                w1 = edge(p2[0], p2[1], p0[0], p0[1], x, y)
-                w2 = edge(p0[0], p0[1], p1[0], p1[1], x, y)
-                if (w0 >= 0 and w1 >= 0 and w2 >= 0) or (w0 <= 0 and w1 <= 0 and w2 <= 0):
-                    fb[y, x] = col
+        gx = np.arange(minx, maxx + 1, dtype=np.int32)[None, :]
+        gy = np.arange(miny, maxy + 1, dtype=np.int32)[:, None]
+        e0 = self._edge(p1[0], p1[1], p2[0], p2[1], gx, gy)
+        e1 = self._edge(p2[0], p2[1], p0[0], p0[1], gx, gy)
+        e2 = self._edge(p0[0], p0[1], p1[0], p1[1], gx, gy)
+        mask = ((e0 >= 0) & (e1 >= 0) & (e2 >= 0)) | ((e0 <= 0) & (e1 <= 0) & (e2 <= 0))
+        sub = fb[miny:maxy + 1, minx:maxx + 1]
+        sub[mask] = col
+
+    @staticmethod
+    def _edge(ax, ay, bx, by, cx, cy):
+        return (cx - ax) * (by - ay) - (cy - ay) * (bx - ax)
 
     def _render_frame(self):
         fb_origin = self.vi_regs[1] & 0x007FFFFE
@@ -7634,19 +8011,20 @@ class Nintendo64:
         """Run one full NTSC frame of VR4300 cycles (93.75 MHz / 60 Hz).
 
         STOPPING after a few thousand instructions left games frozen between
-        vblanks; a real frame is ~1.5M cycles. Each instruction retires 2
-        cycles on average, matching the VR4300's typical throughput.
+        vblanks; a real frame is ~1.5M cycles. Each executed instruction
+        retires ``cycles_per_instruction`` cycles (interpreted cores retire
+        far fewer per wall-clock ms than silicon, so a higher credit keeps
+        spin loops short and games at interactive speed without breaking
+        per-frame pacing).
         """
         step = self.step
         budget = getattr(self, "cycles_per_frame", 1562500)
+        cpi = getattr(self, "cycles_per_instruction", 64)
         cycles = 0
-        prev = (self.pc, self.next_pc)
+        budget += cpi
         while cycles < budget:
             step()
-            cycles += 2
-            if (self.pc, self.next_pc) == prev:
-                break
-            prev = (self.pc, self.next_pc)
+            cycles += cpi
         if draw:
             self._render_frame()
         self.apu.run_frame()
@@ -8496,14 +8874,19 @@ class RetroWindow(arcade.Window if arcade else object):
         arows = [(item, yt + slide_y, yb + slide_y) for item, yt, yb in rows
                  if yb + slide_y >= cur_y_end]
         geos = [{"x0": x0, "w": scale_w, "rows": arows,
-                 "clip_top": cur_y_end, "y_top": wh - MENU_H, "y_bot": vis_bottom}]
+                 "clip_top": cur_y_end, "y_top": wh - MENU_H, "y_bot": vis_bottom, "pop": 1.0}]
         ref_geo, ref_rows = geos[0], arows
-        for parent in path:
+        for idx, parent in enumerate(path):
             rect = next(((yt, yb) for (p, yt, yb) in ref_rows if p is parent), None)
             if rect is None or not parent.get("sub"):
                 break
             yt_p = rect[0]
-            sw = self._ui_sub_width(parent)
+            st = self.ui_hover_t.get(("sub_pop", idx + 1))
+            pop = max(0.0, min(1.0, st[0])) if st is not None else 0.0
+            if pop <= 0.01:
+                break
+            slide = (1.0 - pop) * 6.0
+            sw = self._ui_sub_width(parent) * (0.90 + 0.10 * pop)
             sx0 = ref_geo["x0"] + ref_geo["w"] - 1
             if sx0 + sw > ww:
                 sx0 = ref_geo["x0"] - sw + 1
@@ -8514,10 +8897,11 @@ class RetroWindow(arcade.Window if arcade else object):
             y = top
             for s in parent["sub"]:
                 h = SEP_H if s is None else ITEM_H
-                srows.append((s, y, y - h))
+                srows.append((s, y + slide, y - h + slide))
                 y -= h
             geos.append({"x0": sx0, "w": sw, "rows": srows,
-                         "clip_top": vis_bottom, "y_top": top, "y_bot": bot})
+                         "clip_top": vis_bottom, "y_top": top, "y_bot": bot + slide,
+                         "pop": pop})
             ref_geo, ref_rows = geos[-1], srows
         return geos
 
@@ -8914,6 +9298,24 @@ class RetroWindow(arcade.Window if arcade else object):
 
         # Nested submenu chain (drawn last so deeper panels sit on top)
         if self.ui_open is not None:
+            # Tick per-depth pop tweens; reset when the open chain changes so
+            # newly opened panels pop in instead of appearing fully grown.
+            sig = tuple(id(it) for it in self.ui_path)
+            if sig != getattr(self, "_sub_sig", None):
+                prev = getattr(self, "_sub_sig", ())
+                self._sub_sig = sig
+                n = 0
+                while n < len(sig) and n < len(prev) and sig[n] == prev[n]:
+                    n += 1
+                for d in range(n + 1, 12):
+                    st = self.ui_hover_t.get(("sub_pop", d))
+                    if st is not None:
+                        st[0] = 0.0
+                        st[1] = 0.0
+                        st[2] = 0.0
+                        st[3] = 1.0
+            for d in range(1, len(self.ui_path) + 1):
+                self.ui_tween(("sub_pop", d), 1.0, anim_dt, 0.22)
             geos = self._ui_panel_chain(i, list(getattr(self, "ui_path", [])), wh)
             for depth in range(1, len(geos)):
                 self._ui_draw_sub_panel(geos, depth, wh, alpha, anim_dt)
@@ -8945,6 +9347,9 @@ class RetroWindow(arcade.Window if arcade else object):
         x0, w = geo["x0"], geo["w"]
         rows = geo["rows"]
         if not rows:
+            return
+        alpha = alpha * float(geo.get("pop", 1.0))
+        if alpha <= 0.01:
             return
         top, bot = geo["y_top"], geo["y_bot"]
         self.ui_rect(x0 - 1, bot - 1, x0 + w + 1, top + 1,
@@ -9050,19 +9455,28 @@ class RetroWindow(arcade.Window if arcade else object):
                 self._overlay_max_scroll = max_ov_scroll
                 self.ui_overlay_scroll = max(0.0, min(self.ui_overlay_scroll, max_ov_scroll))
                 self._overlay_row_hits = []
+                mx, my = self.ui_ptr
                 for n, (a, b) in enumerate(rows):
                     y = body_top - n * rh * scale_t + self.ui_overlay_scroll
                     if y < body_bot - 4 or y > body_top + 4:
                         continue
                     self._overlay_row_hits.append((x0 + 8, y - 10, x0 + w - 16, y + 10, a, b))
+                    row_hover = (x0 + 8 <= mx <= x0 + w - 16 and y - 10 <= my <= y + 10)
+                    r_amt = self.ui_tween(("ovrow", a), 1.0 if row_hover else 0.0, anim_dt, 0.16)
+                    if r_amt > 0.01:
+                        ri = (1.0 - r_amt) * 4.0
+                        self.ui_rect(x0 + 6 + ri, y - 9, x0 + w - 10 - ri, y + 9,
+                                     (C_HOT[0], C_HOT[1], C_HOT[2], 0.35 * r_amt * alpha))
                     is_toggle = str(b).lower() in ("on", "off", "true", "false", "yes", "no")
                     if is_toggle:
                         on = str(b).lower() in ("on", "true", "yes")
+                        chk_t = self.ui_tween(("ovchk", a), 1.0 if on else 0.0, anim_dt, 0.16, overshoot=on)
                         self.ui_rect(x0 + 16, y - 6, x0 + 28, y + 6,
                                      (C_EDGE[0], C_EDGE[1], C_EDGE[2], alpha))
-                        if on:
-                            self.ui_rect(x0 + 18, y - 4, x0 + 26, y + 4,
-                                         (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], alpha))
+                        if chk_t > 0.01:
+                            ci = (1.0 - min(1.0, chk_t)) * 4.0
+                            self.ui_rect(x0 + 18 + ci, y - 4 + ci, x0 + 26 - ci, y + 4 - ci,
+                                         (C_ACCENT[0], C_ACCENT[1], C_ACCENT[2], min(1.0, chk_t) * alpha))
                         self.ui_put(self.ui_text(a, C_ACCENT), x0 + 36, y)
                     else:
                         self.ui_put(self.ui_text(a, C_ACCENT), x0 + 24, y)
