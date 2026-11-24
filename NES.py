@@ -2193,6 +2193,7 @@ _PYSNES_HBLANK_FRAC = _PYSNES_HBLANK_START_MC / _PYSNES_MC_PER_SCANLINE
 _PYSNES_SHORT_SCANLINE = 240
 _PYSNES_SHORT_CPU_CYCLES = 226   # 1360 / 6
 _PYSNES_NORMAL_CPU_CYCLES = 227  # 1364 / 6
+_PYSNES_SPC_CYCLES_PER_LINE = 1024000.0 / (262 * FRAME_RATE)
 # VBlank flag rises a few dots into line 225, not exactly at cycle 0.
 _PYSNES_VBLANK_DOT_OFFSET = 2
 
@@ -2849,6 +2850,7 @@ class SNESAPU:
     def __init__(self, sample_rate=44100, mode="snes"):
         self.sr = sample_rate
         self.mode = mode
+        self.core = None        # real SSMP (SPC700+SDSP) when SNES console wires one in
         self.ports_in = [0, 0, 0, 0]
         self.ports_out = [0xAA, 0xBB, 0, 0]
         self.read_polls = [0, 0, 0, 0]
@@ -2871,6 +2873,8 @@ class SNESAPU:
 
     def read_port(self, idx):
         idx &= 3
+        if self.core is not None:
+            return self.core.read_cpuo(idx)
         self.read_polls[idx] += 1
         polls = self.read_polls[idx]
         if polls <= 2:
@@ -2889,6 +2893,9 @@ class SNESAPU:
     def write_port(self, idx, val):
         idx &= 3
         val &= 0xFF
+        if self.core is not None:
+            self.core.cpui[idx] = val
+            return
         self.ports_in[idx] = val
         self.read_polls[idx] = 0
         if idx == 0:
@@ -3020,6 +3027,8 @@ class SNESAPU:
         return out
 
     def _render_snes_samples(self, n):
+        if self.core is not None:
+            return self.core.dsp.render(n, dsp_rate=32000, out_rate=self.sr)
         out = np.zeros(n, dtype=np.float32)
         t = np.arange(n, dtype=np.float64)
         for ch in range(8):
@@ -3053,9 +3062,1260 @@ class SNESAPU:
         self.dc += (m - self.dc) * 0.015
         if n > 2:
             out[1:] = 0.72 * out[1:] + 0.28 * out[:-1]
-        out = np.tanh(out * 1.15) * 0.90
+        if self.core is None:
+            out = np.tanh(out * 1.15) * 0.90
         pcm = np.clip(out * (32767.0 * self.volume), -32767, 32767).astype(np.int16)
         self.sink(pcm)
+
+
+# ==========================================================================
+# SNES APU: SPC700 (S-SMP) audio CPU + S-DSP real implementation
+# ==========================================================================
+
+_SPC_IPL_ROM = bytes((
+    0xCD, 0xEF, 0xBD, 0xE8, 0x00, 0xC6, 0x1D, 0xD0, 0xFC, 0x8F, 0xAA, 0xF4,
+    0x8F, 0xBB, 0xF5, 0x78, 0xCC, 0xF4, 0xD0, 0xFB, 0x2F, 0x19, 0xEB, 0xF4,
+    0xD0, 0xFC, 0x7E, 0xF4, 0xD0, 0x0B, 0xE4, 0xF5, 0xCB, 0xF4, 0xD7, 0x00,
+    0xFC, 0xD0, 0xF3, 0xAB, 0x01, 0x10, 0xEF, 0x7E, 0xF4, 0x10, 0xEB, 0xBA,
+    0xF6, 0xDA, 0x00, 0xBA, 0xF4, 0xC4, 0xF4, 0xDD, 0x5D, 0xD0, 0xDB, 0x1F,
+    0x00, 0x00, 0xC0, 0xFF,
+))
+
+_SPC_RATE = (2048, 1536, 1280, 1024, 768, 640, 512, 384, 320, 256, 192, 160,
+             128, 96, 80, 64, 48, 40, 32, 24, 20, 16, 12, 10, 8, 6, 5, 4, 3,
+             2, 1, 1)
+
+
+class SDSP:
+    """S-DSP: 8 BRR voices, ADSR/GAIN envelope, pitch modulation, echo."""
+
+    def __init__(self):
+        self.reg = bytearray(0x80)
+        self.reset_voices()
+
+    def reset_voices(self):
+        self.brr_addr = [0] * 8
+        self.dec = [[0] * 16 for _ in range(8)]
+        self.v_pos = [16] * 8
+        self.v_p1 = [0] * 8
+        self.v_p2 = [0] * 8
+        self.v_env = [0] * 8
+        self.v_cnt = [0] * 8
+        self.v_evt = [0] * 8
+        self.v_rate = [1] * 8
+        self.v_state = bytearray(8)
+        self.v_out = [0] * 8
+        self.noise = 0x4000
+        self.echo_l = [0.0] * 7680
+        self.echo_r = [0.0] * 7680
+        self.echo_pos = 0
+        self.echo_len = 0
+        self.out_l = 0.0
+        self.out_r = 0.0
+
+    def read(self, addr):
+        return self.reg[addr & 0x7F]
+
+    def write(self, addr, data):
+        addr &= 0x7F
+        v = data & 0xFF
+        if addr == 0x6C and (v & 0x80):
+            self.reset_voices()
+            self.reg[:] = bytearray(0x80)
+            self.reg[0x6C] = 0xE0 if (v & 0x40) else 0xA0
+            return
+        self.reg[addr] = v
+        if addr == 0x4C:
+            for i in range(8):
+                if v & (1 << i):
+                    self._kon(i)
+        elif addr == 0x5C:
+            for i in range(8):
+                if (v & (1 << i)) and self.v_state[i] not in (3, 0):
+                    self.v_state[i] = 4
+                    self.v_evt[i] = 0
+                    self.v_rate[i] = 1
+        elif addr == 0x7D:
+            self.echo_len = (v & 0x0F) * 512
+            if self.echo_pos >= self.echo_len:
+                self.echo_pos = 0
+
+    def _kon(self, v):
+        vv = v * 0x10
+        srcn = self.reg[vv + 4]
+        base = self.reg[0x5D] << 8
+        self.brr_addr[v] = self.ram[(base + srcn * 2) & 0xFFFF] | \
+            (self.ram[(base + srcn * 2 + 1) & 0xFFFF] << 8)
+        self.v_pos[v] = 16
+        self.v_cnt[v] = 0
+        self.v_env[v] = 0
+        self.v_state[v] = 1
+        adsr1 = self.reg[vv + 5]
+        if adsr1 & 0x80:
+            r = adsr1 & 0x1F
+            if r == 0x1F:
+                self.v_env[v] = 0x7FF
+            self.v_rate[v] = 1 if r == 0x1F else _SPC_RATE[r]
+        else:
+            g = self.reg[vv + 7]
+            mode = (g >> 5) & 3
+            if mode == 0:
+                self.v_env[v] = 0x800
+                self.v_state[v] = 3
+                self.v_rate[v] = 1
+            elif mode in (1, 2):
+                self.v_env[v] = 0
+                self.v_state[v] = 1
+                self.v_rate[v] = _SPC_RATE[g & 0x1F] if (g & 0x1F) else 1
+            else:
+                s = (g & 0x1F) * 0x040
+                self.v_env[v] = s
+                self.v_state[v] = 3
+                self.v_rate[v] = 1
+
+    def _brr_step(self, v):
+        ram = self.ram
+        addr = self.brr_addr[v]
+        head = ram[addr & 0xFFFF]
+        end = head & 1
+        loop = head & 2
+        shift = head >> 4
+        filt = (head >> 2) & 3
+        p1, p2 = self.v_p1[v], self.v_p2[v]
+        d = self.dec[v]
+        pos = self.v_pos[v] & 15
+        for i in range(8):
+            b = ram[(addr + 1 + i) & 0xFFFF]
+            for nib in ((b >> 4) & 0x0F, b & 0x0F):
+                if shift > 12:
+                    s = -2048 if (nib & 8) else 2048
+                elif shift == 12:
+                    s = (-2048 | (nib << shift)) if (nib & 8) else (nib << shift)
+                else:
+                    s = (nib - ((nib & 8) << 1)) << shift
+                if filt == 1:
+                    s = s + p1 - (p1 >> 4)
+                elif filt == 2:
+                    s = s + 2 * p1 + ((-3 * p1) >> 5) - p2 + (p2 >> 4)
+                elif filt == 3:
+                    s = s + 2 * p1 + ((-13 * p1) >> 6) - p2 + ((3 * p2) >> 4)
+                if s > 32767:
+                    s = 32767
+                elif s < -32768:
+                    s = -32768
+                p2, p1 = p1, s
+                d[pos] = s
+                pos = (pos + 1) & 15
+        self.v_p1[v], self.v_p2[v] = p1, p2
+        self.v_pos[v] = pos
+        self.brr_addr[v] = (addr + 9) & 0xFFFF
+        if end:
+            if loop:
+                srcn = self.reg[v * 0x10 + 4]
+                base = self.reg[0x5D] << 8
+                self.brr_addr[v] = self.ram[(base + srcn * 2) & 0xFFFF] | \
+                    (self.ram[(base + srcn * 2 + 1) & 0xFFFF] << 8)
+            elif not (self.reg[0x6C] & 0x20):
+                state = self.v_state[v]
+                self.v_state[v] = 3
+                if state == 1:
+                    self.v_env[v] = 0
+                self.v_rate[v] = 1
+
+    def _env_step(self, v):
+        vv = v * 0x10
+        st = self.v_state[v]
+        env = self.v_env[v]
+        if st == 0:
+            self.v_env[v] = 0
+            return
+        if st == 1:
+            if self.reg[vv + 5] & 0x80:
+                env += 0x20
+                if env >= 0x800:
+                    env = 0x800
+                    self.v_state[v] = 2
+                    self.v_evt[v] = 0
+                    self.v_rate[v] = _SPC_RATE[(self.reg[vv + 6] >> 5) & 0x0F]
+            else:
+                g = self.reg[vv + 7]
+                mode = (g >> 5) & 3
+                if mode == 0:
+                    env = 0x800
+                    self.v_state[v] = 3
+                    self.v_rate[v] = 1
+                elif mode == 1:
+                    env -= 0x20
+                    if env <= 0:
+                        env = 0
+                        self.v_state[v] = 0
+                        self.v_rate[v] = 1
+                elif mode == 2:
+                    env += 0x20
+                    if env >= 0x800:
+                        env = 0x800
+                        self.v_state[v] = 3
+                        self.v_rate[v] = 1
+                else:
+                    env += max(1, env >> 8)
+                    if env >= 0x800:
+                        env = 0x800
+                        self.v_state[v] = 3
+                        self.v_rate[v] = 1
+        elif st == 2:
+            env -= max(1, env >> 6)
+            slv = (((self.reg[vv + 6] >> 5) & 7) + 1) << 6
+            if env <= slv:
+                env = slv
+                self.v_state[v] = 3
+                self.v_evt[v] = 0
+                self.v_rate[v] = _SPC_RATE[self.reg[vv + 6] & 0x1F]
+        elif st == 3:
+            if not self.reg[vv + 5] & 0x80:
+                g = self.reg[vv + 7]
+                mode = (g >> 5) & 3
+                if mode == 0:
+                    env = 0x800
+                elif mode == 1:
+                    env = min(0x800, (g & 0x7F) << 3)
+                elif mode == 2:
+                    env += 0x20
+                    if env >= 0x800:
+                        env = 0x800
+                else:
+                    env += max(1, env >> 8)
+                    if env >= 0x800:
+                        env = 0x800
+        elif st == 4:
+            env -= max(1, env >> 8)
+            if env <= 0:
+                env = 0
+                self.v_state[v] = 0
+        self.v_env[v] = 0 if env < 0 else (0x800 if env > 0x800 else env)
+
+    def sample(self):
+        reg = self.reg
+        flag = reg[0x6C]
+        if flag & 0x80:
+            self.out_l = 0.0
+            self.out_r = 0.0
+            return
+        nl = 0
+        nr = 0
+        for v in range(8):
+            vv = v * 0x10
+            self._env_step(v)
+            p = (reg[vv + 2] | (reg[vv + 3] << 8)) & 0x3FFF
+            if reg[0x6C] & 0x20:
+                if v == 0:
+                    self.noise_cnt += 1
+                    if self.noise_cnt >= self.noise_rate:
+                        self.noise_cnt = 0
+                        fb = ((self.noise >> 14) ^ (self.noise >> 15)) & 1
+                        self.noise = ((self.noise << 1) | fb) & 0x7FFF
+                smp = self.noise if self.noise < 0x8000 else self.noise - 0x10000
+                smp >>= 1
+            else:
+                if v and (reg[0x2D] >> v) & 1:
+                    p += ((self.v_out[v - 1] * p) >> 11) & ~0x3FFF
+                    p &= 0x3FFF
+                self.v_cnt[v] += max(1, p)
+                if self.v_cnt[v] >= 0x1000:
+                    self.v_cnt[v] -= 0x1000
+                    self.v_pos[v] += 1
+                    if self.v_pos[v] >= 16:
+                        self._brr_step(v)
+                smp = self.dec[v][self.v_pos[v] & 15]
+            env = self.v_env[v]
+            out = (smp * env) >> 11
+            self.v_out[v] = out
+            vl = reg[vv] - 0x100 if reg[vv] & 0x80 else reg[vv]
+            vr = reg[vv + 1] - 0x100 if reg[vv + 1] & 0x80 else reg[vv + 1]
+            nl += (out * vl) >> 7
+            nr += (out * vr) >> 7
+        echo_in = 0
+        eon = reg[0x4D]
+        if eon:
+            for v in range(8):
+                if eon & (1 << v):
+                    echo_in += self.v_out[v]
+        outl = (nl * (reg[0x2C] - 0x100 if reg[0x2C] & 0x80 else reg[0x2C])) >> 7
+        outr = (nr * (reg[0x3C] - 0x100 if reg[0x3C] & 0x80 else reg[0x3C])) >> 7
+        if self.echo_len and (eon or (reg[0x0C] or reg[0x1C])):
+            el = self.echo_l[self.echo_pos]
+            er = self.echo_r[self.echo_pos]
+            ev_l = reg[0x0C] - 0x100 if reg[0x0C] & 0x80 else reg[0x0C]
+            ev_r = reg[0x1C] - 0x100 if reg[0x1C] & 0x80 else reg[0x1C]
+            outl += el * ev_l / 128.0
+            outr += er * ev_r / 128.0
+            if eon and not flag & 0x40:
+                efb = reg[0x0D] - 0x100 if reg[0x0D] & 0x80 else reg[0x0D]
+                fb = efb / 128.0
+                w_l = echo_in + el * fb
+                w_r = echo_in + er * fb
+                self.echo_l[self.echo_pos] = -32768.0 if w_l < -32768.0 else (32767.0 if w_l > 32767.0 else w_l)
+                self.echo_r[self.echo_pos] = -32768.0 if w_r < -32768.0 else (32767.0 if w_r > 32767.0 else w_r)
+            self.echo_pos += 1
+            if self.echo_pos >= self.echo_len:
+                self.echo_pos = 0
+            if flag & 0x20:
+                outl = max(-32768, min(32767, outl))
+                outr = max(-32768, min(32767, outr))
+        self.out_l = outl / 32768.0
+        self.out_r = outr / 32768.0
+        if self.out_l > 1.0:
+            self.out_l = 1.0
+        elif self.out_l < -1.0:
+            self.out_l = -1.0
+        if self.out_r > 1.0:
+            self.out_r = 1.0
+        elif self.out_r < -1.0:
+            self.out_r = -1.0
+
+    def render(self, n, dsp_rate=32000, out_rate=32000):
+        out = np.zeros(n, dtype=np.float32)
+        acc = 0.0
+        inc = float(dsp_rate) / float(out_rate)
+        for i in range(n):
+            acc += inc
+            while acc >= 1.0:
+                self.sample()
+                acc -= 1.0
+            out[i] = (self.out_l + self.out_r) * 0.5
+        return out
+
+
+class SSMP:
+    """SPC700 (S-SMP) audio CPU with timers, CPUIO ports and attached S-DSP."""
+
+    def __init__(self):
+        self.ram = bytearray(65536)
+        self.dsp = SDSP()
+        self.a = self.x = self.y = 0
+        self.sp = 0xEF
+        self.pc = 0xFFC0
+        self.n = self.v = self.p = self.h = self.i = self.z = self.c = 0
+        self.b = 0
+        self.test = 0x0A
+        self.control = 0xB0
+        self.dsp_addr = 0
+        self.cpui = [0, 0, 0, 0]
+        self.cpuo = [0, 0, 0, 0]
+        self.cpuo_pending = [[], [], [], []]
+        self.t_targets = [0, 0, 0]
+        self.t_enable = [False, False, False]
+        self.t_cnt = [0, 0, 0]
+        self.t_out = [0, 0, 0]
+        self.cycle = 0
+        self._left = 0.0
+        self.sleeping = False
+        self.halted = False
+        self.out_rate = 32000.0
+
+    def rd(self, addr):
+        addr &= 0xFFFF
+        if addr >= 0xFFC0 and self.control & 0x80:
+            return _SPC_IPL_ROM[addr - 0xFFC0]
+        if 0xF0 <= addr <= 0xFF:
+            return self.io_rd(addr)
+        return self.ram[addr]
+
+    def wr(self, addr, v):
+        addr &= 0xFFFF
+        v &= 0xFF
+        self.ram[addr] = v
+        if 0xF0 <= addr <= 0xFF:
+            self.io_wr(addr, v)
+
+    def io_rd(self, addr):
+        if addr == 0xF2:
+            return self.dsp_addr
+        if addr == 0xF3:
+            return self.dsp.read(self.dsp_addr)
+        if 0xF4 <= addr <= 0xF7:
+            return self.cpui[addr - 0xF4]
+        if 0xF8 <= addr <= 0xF9:
+            return self.ram[addr]
+        if 0xFA <= addr <= 0xFC:
+            return 0
+        if 0xFD <= addr <= 0xFF:
+            t = addr - 0xFD
+            v = self.t_out[t]
+            self.t_out[t] = 0
+            return v
+        return 0
+
+    def io_wr(self, addr, v):
+        if addr == 0xF0:
+            self.test = v
+        elif addr == 0xF1:
+            self.control = v
+            if v & 0x10:
+                self.cpui[0] = self.cpui[1] = 0
+            if v & 0x20:
+                self.cpui[2] = self.cpui[3] = 0
+            for t in range(3):
+                en = (v >> t) & 1
+                if en and not self.t_enable[t]:
+                    self.t_cnt[t] = 0
+                    self.t_out[t] = 0
+                self.t_enable[t] = bool(en)
+        elif addr == 0xF2:
+            self.dsp_addr = v
+        elif addr == 0xF3:
+            self.dsp.write(self.dsp_addr, v)
+        elif 0xF4 <= addr <= 0xF7:
+            i = addr - 0xF4
+            self.cpuo[i] = v
+            q = self.cpuo_pending[i]
+            q.append(v)
+            if len(q) > 8:
+                del q[0]
+        elif 0xFA <= addr <= 0xFC:
+            self.t_targets[addr - 0xFA] = v
+
+    def read_cpuo(self, idx):
+        idx &= 3
+        q = self.cpuo_pending[idx]
+        if q:
+            self.cpuo[idx] = q.pop(0)
+        return self.cpuo[idx]
+
+    def tick_timers(self, c):
+        prev = self.cycle
+        self.cycle += c
+        t2d = (self.cycle // 16) - (prev // 16)
+        t01d = (self.cycle // 128) - (prev // 128)
+        out = self.t_out
+        fired = False
+        for t, d in ((0, t01d), (1, t01d), (2, t2d)):
+            if not self.t_enable[t] or not d:
+                continue
+            s2 = self.t_cnt[t]
+            tgt = self.t_targets[t] or 256
+            for _ in range(d):
+                s2 += 1
+                if s2 > 255:
+                    s2 = 256
+                if s2 == tgt:
+                    out[t] = (out[t] + 1) & 0x0F
+                    s2 = 0
+                    fired = True
+                elif s2 > 255:
+                    s2 = 0
+            self.t_cnt[t] = s2
+        return fired
+
+    def run(self, cycles):
+        if self.sleeping:
+            fired = self.tick_timers(cycles)
+            self._left = 0.0
+            if fired and not self.i:
+                self.sleeping = False
+                self._irq()
+            return
+        if self.halted:
+            self.tick_timers(cycles)
+            self._left = 0.0
+            return
+        self._left += cycles
+        while self._left >= 1.0:
+            c = self.step()
+            self._left -= c
+            fired = self.tick_timers(c)
+            if fired and not self.i and not self.sleeping and not self.halted:
+                self._irq()
+                self._left = 0.0
+                return
+            if self.sleeping or self.halted:
+                self.tick_timers(self._left)
+                self._left = 0.0
+                return
+
+    def _irq(self):
+        self._push16(self.pc)
+        self._push(self.get_psw() | 0x10)
+        self.i = 1
+        self.pc = self.rd(0xFFDE) | (self.rd(0xFFDF) << 8)
+
+    def get_psw(self):
+        return (self.n << 7) | (self.v << 6) | (self.p << 5) | (self.b << 4) | (self.h << 3) | \
+            (self.i << 2) | (self.z << 1) | self.c
+
+    def set_psw(self, v):
+        v &= 0xFF
+        self.n = (v >> 7) & 1
+        self.v = (v >> 6) & 1
+        self.p = (v >> 5) & 1
+        self.b = (v >> 4) & 1
+        self.h = (v >> 3) & 1
+        self.i = (v >> 2) & 1
+        self.z = (v >> 1) & 1
+        self.c = v & 1
+
+    def _fetch8(self):
+        v = self.rd(self.pc)
+        self.pc = (self.pc + 1) & 0xFFFF
+        return v
+
+    def _fetch16(self):
+        lo = self._fetch8()
+        return lo | (self._fetch8() << 8)
+
+    def _push(self, v):
+        self.ram[0x0100 | self.sp] = v & 0xFF
+        self.sp = (self.sp - 1) & 0xFF
+
+    def _pop(self):
+        self.sp = (self.sp + 1) & 0xFF
+        return self.ram[0x0100 | self.sp]
+
+    def _push16(self, v):
+        self._push((v >> 8) & 0xFF)
+        self._push(v & 0xFF)
+
+    def _pop16(self):
+        lo = self._pop()
+        return lo | (self._pop() << 8)
+
+    def _nz(self, v):
+        v &= 0xFF
+        self.n = 1 if v & 0x80 else 0
+        self.z = 1 if v == 0 else 0
+        return v
+
+    def _nz16(self, v):
+        v &= 0xFFFF
+        self.n = 1 if v & 0x8000 else 0
+        self.z = 1 if v == 0 else 0
+        return v
+
+    def _adc(self, a, b, dec=False):
+        cc = self.c
+        if dec:
+            lo = (a & 0x0F) + (b & 0x0F) + cc
+            if lo > 9:
+                lo += 6
+            hi = (a >> 4) + (b >> 4) + (1 if lo > 15 else 0)
+            if hi > 9:
+                hi += 6
+            r = ((hi << 4) | (lo & 0x0F)) & 0xFF
+            self.c = 1 if hi > 15 else 0
+            self.h = 1 if ((a & 0x0F) + (b & 0x0F) + cc) > 9 else 0
+        else:
+            r = a + b + cc
+            self.c = 1 if r > 0xFF else 0
+            r &= 0xFF
+            self.h = 1 if ((a & 0x0F) + (b & 0x0F) + cc) > 0x0F else 0
+        self.v = 1 if (~(a ^ b) & (a ^ r) & 0x80) else 0
+        return self._nz(r)
+
+    def _sbc(self, a, b, dec=False):
+        cc = 1 - self.c
+        br = ((a & 0x0F) - (b & 0x0F) - cc) < 0
+        if dec:
+            r = a - b - cc
+            if br:
+                r -= 0x06
+            self.c = 0 if r < 0 else 1
+            if r < 0:
+                r -= 0x60
+            r &= 0xFF
+        else:
+            r = a - b - cc
+            self.c = 0 if r < 0 else 1
+            r &= 0xFF
+        self.h = 0 if br else 1
+        self.v = 1 if (((a ^ b) & (a ^ r)) & 0x80) else 0
+        return self._nz(r)
+
+    def _cmp(self, a, b):
+        self.c = 1 if a >= b else 0
+        return self._nz((a - b) & 0xFF)
+
+    def _dp_page(self):
+        return 0x100 if self.p else 0
+
+    def _rd16_dp(self, off):
+        pge = self._dp_page()
+        off &= 0xFF
+        lo = self.rd(pge | (off & 0xFF))
+        hi = self.rd(pge | ((off + 1) & 0xFF))
+        return lo | (hi << 8)
+
+    def _dp_ptr_x(self, d):
+        pge = self._dp_page()
+        off = (d + self.x) & 0xFF
+        return self.rd(pge | (off & 0xFF)) | (self.rd(pge | ((off + 1) & 0xFF)) << 8)
+
+    def _dp_b(self, d):
+        return self._dp_page() | (d & 0xFF)
+
+    def _alu_operand(self, col, odd):
+        """Resolve (cyc, ad, old, m) for ALU rows. old=None -> A is operand."""
+        if odd:
+            if col == 4:
+                ad = self._dp_b((self._fetch8() + self.x) & 0xFF)
+                return 4, ad, None, self.rd(ad)
+            if col == 5:
+                ad = (self._fetch16() + self.x) & 0xFFFF
+                return 5, ad, None, self.rd(ad)
+            if col == 6:
+                ad = (self._fetch16() + self.y) & 0xFFFF
+                return 5, ad, None, self.rd(ad)
+            if col == 7:
+                d = self._fetch8()
+                ad = (self._rd16_dp(d) + self.y) & 0xFFFF
+                return 6, ad, None, self.rd(ad)
+            if col == 8:
+                imm = self._fetch8()
+                ad = self._dp_b(self._fetch8())
+                return 5, ad, self.rd(ad), imm
+            if col == 9:
+                return 5, self.x & 0xFF, self.rd(self.x & 0xFF), self.rd(self.y & 0xFF)
+            imm = self._fetch8()
+            ad = self._fetch16()
+            return 5, ad, self.rd(ad), imm
+        if col == 4:
+            ad = self._dp_b(self._fetch8())
+            return 3, ad, None, self.rd(ad)
+        if col == 5:
+            ad = self._fetch16()
+            return 4, ad, None, self.rd(ad)
+        if col == 6:
+            return 3, 0, None, self.rd(self.x & 0xFF)
+        if col == 7:
+            d = self._fetch8()
+            pge = self._dp_page()
+            off = (d + self.x) & 0xFF
+            ad = self.rd(pge | (off & 0xFF)) | (self.rd(pge | ((off + 1) & 0xFF)) << 8)
+            return 6, ad, None, self.rd(ad)
+        if col == 8:
+            return 2, 0, None, self._fetch8()
+        b1 = self._fetch8()
+        b2 = self._fetch8()
+        pge = self._dp_page()
+        ad = pge | b2
+        return 6, ad, self.rd(ad), self.rd(pge | b1)
+
+    def _alu_exec(self, fam, old, m):
+        """fam: 0 OR, 1 AND, 2 EOR, 3 CMP, 4 ADC, 5 SBC. Returns result or None."""
+        dec = False
+        if old is None:
+            a = self.a & 0xFF
+            if fam == 0:
+                self.a = self._nz(a | m)
+            elif fam == 1:
+                self.a = self._nz(a & m)
+            elif fam == 2:
+                self.a = self._nz(a ^ m)
+            elif fam == 3:
+                self._cmp(a, m)
+            elif fam == 4:
+                self.a = self._adc(a, m, dec=dec)
+            else:
+                self.a = self._sbc(a, m, dec=dec)
+            return self.a
+        if fam == 0:
+            r = self._nz(old | m)
+        elif fam == 1:
+            r = self._nz(old & m)
+        elif fam == 2:
+            r = self._nz(old ^ m)
+        elif fam == 3:
+            self._cmp(old, m)
+            return None
+        elif fam == 4:
+            r = self._adc(old, m, dec=dec)
+        else:
+            r = self._sbc(old, m, dec=dec)
+        return r
+
+    def step(self):
+        op = self._fetch8()
+        col = op & 0x0F
+        row = op >> 4
+
+        # ---- Columns x4-x9: ALU (rows 0-B) / MOV (rows C-F) families ----
+        if 4 <= col <= 9 and row < 0xC:
+            fam = row >> 1
+            cyc, ad, old, m = self._alu_operand(col, row & 1)
+            r = self._alu_exec(fam, old, m)
+            if fam != 3 and old is not None:
+                self.wr(ad, r)
+            return cyc
+
+        if 4 <= col <= 9:
+            pge = self._dp_page()
+            if col == 4:
+                if row == 0xC:
+                    self.wr(self._dp_b(self._fetch8()), self.a); return 4
+                if row == 0xD:
+                    self.wr(self._dp_b((self._fetch8() + self.x) & 0xFF), self.a); return 5
+                if row == 0xE:
+                    self.a = self._nz(self.rd(self._dp_b(self._fetch8()))); return 3
+                self.a = self._nz(self.rd(self._dp_b((self._fetch8() + self.x) & 0xFF))); return 4
+            if col == 5:
+                if row == 0xC:
+                    self.wr(self._fetch16(), self.a); return 5
+                if row == 0xD:
+                    self.wr((self._fetch16() + self.x) & 0xFFFF, self.a); return 6
+                if row == 0xE:
+                    self.a = self._nz(self.rd(self._fetch16())); return 4
+                self.a = self._nz(self.rd((self._fetch16() + self.x) & 0xFFFF)); return 5
+            if col == 6:
+                if row == 0xC:
+                    self.wr(self.x & 0xFF, self.a); return 4
+                if row == 0xD:
+                    self.wr((self._fetch16() + self.y) & 0xFFFF, self.a); return 6
+                if row == 0xE:
+                    self.a = self._nz(self.rd(self.x & 0xFF)); return 3
+                self.a = self._nz(self.rd((self._fetch16() + self.y) & 0xFFFF)); return 5
+            if col == 7:
+                d = self._fetch8()
+                if row == 0xC:
+                    self.wr(self._dp_ptr_x(d), self.a); return 7
+                if row == 0xD:
+                    self.wr((self._rd16_dp(d) + self.y) & 0xFFFF, self.a); return 7
+                if row == 0xE:
+                    self.a = self._nz(self.rd(self._dp_ptr_x(d))); return 6
+                self.a = self._nz(self.rd((self._rd16_dp(d) + self.y) & 0xFFFF)); return 6
+            if col == 8:
+                if row == 0xC:
+                    self._cmp(self.x, self._fetch8()); return 2
+                if row == 0xD:
+                    self.wr(self._dp_b(self._fetch8()), self.x); return 4
+                if row == 0xE:
+                    self.a = self._nz(self._fetch8()); return 2
+                self.x = self._nz(self.rd(self._dp_b(self._fetch8()))); return 3
+            if col == 9:
+                if row == 0xC:
+                    self.wr(self._fetch16(), self.x); return 5
+                if row == 0xD:
+                    self.wr(self._dp_b((self._fetch8() + self.y) & 0xFF), self.x); return 5
+                if row == 0xE:
+                    self.x = self._nz(self.rd(self._fetch16())); return 4
+                self.x = self._nz(self.rd(self._dp_b((self._fetch8() + self.y) & 0xFF))); return 4
+
+        # ---- Column x0: flags / branches ----
+        if col == 0:
+            if row == 0:
+                return 2
+            if row == 2:
+                self.p = 0; return 2
+            if row == 4:
+                self.p = 1; return 2
+            if row == 6:
+                self.c = 0; return 2
+            if row == 8:
+                self.c = 1; return 2
+            if row == 0xA:
+                self.i = 1; return 3
+            if row == 0xC:
+                self.i = 0; return 3
+            if row == 0xE:
+                self.v = 0; self.h = 0; return 2
+            off = self._fetch8()
+            if off & 0x80:
+                off -= 256
+            if (row == 1 and not self.n) or (row == 3 and self.n) or \
+               (row == 5 and not self.v) or (row == 7 and self.v) or \
+               (row == 9 and not self.c) or (row == 0xB and self.c) or \
+               (row == 0xD and not self.z) or (row == 0xF and self.z):
+                self.pc = (self.pc + off) & 0xFFFF
+                return 4
+            return 2
+
+        # ---- Column x1: TCALL ----
+        if col == 1:
+            self._push16(self.pc)
+            vlo = 0xFFDE - (row << 1)
+            self.pc = self.rd(vlo) | (self.rd((vlo + 1) & 0xFFFF) << 8)
+            return 8
+
+        # ---- Column x2: SET1 / CLR1 ----
+        if col == 2:
+            d = self._fetch8()
+            ad = self._dp_b(d)
+            v = self.rd(ad)
+            bit = row >> 1
+            self.wr(ad, (v | (1 << bit)) if not (row & 1) else (v & ~(1 << bit)))
+            return 4
+
+        # ---- Column x3: BBS / BBC ----
+        if col == 3:
+            d = self._fetch8()
+            bit = row >> 1
+            m = self.rd(self._dp_b(d))
+            off = self._fetch8()
+            if off & 0x80:
+                off -= 256
+            if ((m & (1 << bit)) != 0) == (not (row & 1)):
+                self.pc = (self.pc + off) & 0xFFFF
+                return 7
+            return 5
+
+        # ---- Column xA: bit ops / word ops ----
+        if col == 0xA:
+            if row == 0xF:
+                d1 = self._fetch8()
+                d2 = self._fetch8()
+                pge = self._dp_page()
+                self.wr(pge | d2, self.rd(pge | d1))
+                return 5
+            if row in (0x1, 0x3, 0x5, 0x7, 0x9, 0xB, 0xD):
+                d = self._fetch8()
+                pge = self._dp_page()
+                if row == 0x1:
+                    w = (self.rd(pge | d) | (self.rd(pge | ((d + 1) & 0xFF)) << 8)) - 1
+                    r = self._nz16(w)
+                    self.wr(pge | d, r & 0xFF)
+                    self.wr(pge | ((d + 1) & 0xFF), (r >> 8) & 0xFF)
+                    return 6
+                if row == 0x3:
+                    w = (self.rd(pge | d) | (self.rd(pge | ((d + 1) & 0xFF)) << 8)) + 1
+                    r = self._nz16(w)
+                    self.wr(pge | d, r & 0xFF)
+                    self.wr(pge | ((d + 1) & 0xFF), (r >> 8) & 0xFF)
+                    return 6
+                if row == 0x5:
+                    w = self.rd(pge | d) | (self.rd(pge | ((d + 1) & 0xFF)) << 8)
+                    ya = (self.y << 8) | self.a
+                    self.c = 1 if ya >= w else 0
+                    self._nz16((ya - w) & 0xFFFF)
+                    return 4
+                if row == 0x7 or row == 0x9:
+                    w = self.rd(pge | d) | (self.rd(pge | ((d + 1) & 0xFF)) << 8)
+                    ya = (self.y << 8) | self.a
+                    if row == 0x7:
+                        r = ya + w
+                        self.c = 1 if r > 0xFFFF else 0
+                        hb = ((ya >> 8) & 0xF) + ((w >> 8) & 0xF) + (1 if (ya & 0xFF) + (w & 0xFF) > 0xFF else 0)
+                        self.h = 1 if hb > 0xF else 0
+                        self.v = 1 if ((~(ya ^ w) & (ya ^ r)) & 0x8000) else 0
+                    else:
+                        r = (ya - w) & 0xFFFF
+                        self.c = 1 if ya >= w else 0
+                        lowb = (ya & 0xFF) - (w & 0xFF) < 0
+                        hb = ((ya >> 8) & 0xF) - ((w >> 8) & 0xF) - int(lowb)
+                        self.h = 0 if hb < 0 else 1
+                        self.v = 1 if (((ya ^ w) & (ya ^ r)) & 0x8000) else 0
+                    self._nz16(r)
+                    self.y = (r >> 8) & 0xFF
+                    self.a = r & 0xFF
+                    return 5
+                if row == 0xB:
+                    w = self.rd(pge | d) | (self.rd(pge | ((d + 1) & 0xFF)) << 8)
+                    self.a = w & 0xFF
+                    self.y = (w >> 8) & 0xFF
+                    self._nz16(w)
+                    return 5
+                if row == 0xD:
+                    self.wr(pge | d, self.a)
+                    self.wr(pge | ((d + 1) & 0xFF), self.y)
+                    return 5
+            b1 = self._fetch8()
+            b2 = self._fetch8()
+            bit = (b2 >> 5) & 7
+            ad = ((b2 & 0x1F) << 8) | b1
+            if row in (0x0, 0x2, 0x4, 0x6, 0x8, 0xA, 0xE):
+                bitv = (self.rd(ad) >> bit) & 1
+                nb = bitv ^ 1
+                if row == 0x0:
+                    self.c = 1 if (self.c | bitv) else 0
+                elif row == 0x2:
+                    self.c = 1 if (self.c | nb) else 0
+                elif row == 0x4:
+                    self.c = 1 if (self.c & bitv) else 0
+                elif row == 0x6:
+                    self.c = 1 if (self.c & nb) else 0
+                elif row == 0x8:
+                    self.c = 1 if (self.c ^ bitv) else 0
+                elif row == 0xA:
+                    self.c = bitv
+                elif row == 0xE:
+                    b = self.rd(ad)
+                    self.wr(ad, (b & ~(1 << bit)) | (nb << bit))
+                if row in (0xE,):
+                    return 5
+                return 5 if row in (0x0, 0x2, 0x8) else 4
+            if row == 0xC:
+                b = self.rd(ad)
+                b = (b | (1 << bit)) if self.c else (b & ~(1 << bit))
+                self.wr(ad, b)
+                return 6
+
+        # ---- Column xB: dp shifts / inc / dec, MOV Y ----
+        if col == 0xB:
+            if row == 0xC:
+                self.wr(self._dp_b(self._fetch8()), self.y); return 4
+            if row == 0xD:
+                self.wr(self._dp_b((self._fetch8() + self.x) & 0xFF), self.y); return 5
+            if row == 0xE:
+                self.y = self._nz(self.rd(self._dp_b(self._fetch8()))); return 3
+            if row == 0xF:
+                self.y = self._nz(self.rd(self._dp_b((self._fetch8() + self.x) & 0xFF))); return 4
+            d = self._fetch8()
+            pge = self._dp_page()
+            if row & 1:
+                ad = self._dp_b((d + self.x) & 0xFF)
+                cyc = 5
+            else:
+                ad = self._dp_b(d)
+                cyc = 4
+            v = self.rd(ad)
+            if row < 8:
+                if row < 2:
+                    self.c = (v >> 7) & 1
+                    v = (v << 1) & 0xFF
+                elif row < 4:
+                    nc = (v >> 7) & 1
+                    v = ((v << 1) | self.c) & 0xFF
+                    self.c = nc
+                elif row < 6:
+                    self.c = v & 1
+                    v >>= 1
+                else:
+                    nc = v & 1
+                    v = (v >> 1) | (self.c << 7)
+                    self.c = nc
+            elif row < 0xA:
+                v = (v - 1) & 0xFF
+            else:
+                v = (v + 1) & 0xFF
+            self._nz(v)
+            self.wr(ad, v)
+            return cyc
+
+        # ---- Column xC: !a shifts / inc / dec, A/X/Y inc/dec, MOV !a,Y / Y,!a ----
+        if col == 0xC:
+            if row == 0xD:
+                self.y = self._nz((self.y - 1) & 0xFF); return 2
+            if row == 0xF:
+                self.y = self._nz((self.y + 1) & 0xFF); return 2
+            if row == 0xC:
+                self.wr(self._fetch16(), self.y); return 5
+            if row == 0xE:
+                self.y = self._nz(self.rd(self._fetch16())); return 4
+            if row == 0x9:
+                self.a = self._nz((self.a - 1) & 0xFF); return 2
+            if row == 0xB:
+                self.a = self._nz((self.a + 1) & 0xFF); return 2
+            if row in (0x1, 0x3, 0x5, 0x7):
+                v = self.a
+                if row == 0x1:
+                    self.c = (v >> 7) & 1
+                    v = (v << 1) & 0xFF
+                elif row == 0x3:
+                    nc = (v >> 7) & 1
+                    v = ((v << 1) | self.c) & 0xFF
+                    self.c = nc
+                elif row == 0x5:
+                    self.c = v & 1
+                    v >>= 1
+                else:
+                    nc = v & 1
+                    v = (v >> 1) | (self.c << 7)
+                    self.c = nc
+                self.a = self._nz(v)
+                return 2
+            ad = self._fetch16()
+            v = self.rd(ad)
+            if row < 8:
+                if row < 2:
+                    self.c = (v >> 7) & 1
+                    v = (v << 1) & 0xFF
+                elif row < 4:
+                    nc = (v >> 7) & 1
+                    v = ((v << 1) | self.c) & 0xFF
+                    self.c = nc
+                elif row < 6:
+                    self.c = v & 1
+                    v >>= 1
+                else:
+                    nc = v & 1
+                    v = (v >> 1) | (self.c << 7)
+                    self.c = nc
+            elif row == 8:
+                v = (v - 1) & 0xFF
+            else:
+                v = (v + 1) & 0xFF
+            self._nz(v)
+            self.wr(ad, v)
+            return 5
+
+        # ---- Column xD: implied / stack / reg moves ----
+        if col == 0xD:
+            if row == 0x0:
+                self._push(self.get_psw()); return 4
+            if row == 0x2:
+                self._push(self.a); return 4
+            if row == 0x4:
+                self._push(self.x); return 4
+            if row == 0x6:
+                self._push(self.y); return 4
+            if row == 0x8:
+                self.y = self._nz(self._fetch8()); return 2
+            if row == 0xA:
+                self._cmp(self.y, self._fetch8()); return 2
+            if row == 0x1:
+                self.x = self._nz((self.x - 1) & 0xFF); return 2
+            if row == 0x3:
+                self.x = self._nz((self.x + 1) & 0xFF); return 2
+            if row == 0x5:
+                self.x = self._nz(self.a); return 2
+            if row == 0x7:
+                self.a = self._nz(self.x); return 2
+            if row == 0x9:
+                self.x = self._nz(self.sp); return 2
+            if row == 0xB:
+                self.sp = self.x; return 2
+            if row == 0xC:
+                self.x = self._nz(self._fetch8()); return 2
+            if row == 0xD:
+                self.a = self._nz(self.y); return 2
+            if row == 0xE:
+                self.c = 1 if not self.c else 0; return 3
+            self.y = self._nz(self.a); return 2
+
+        # ---- Column xE: TSET1/TCLR1, cmp X/Y, CBNE/DBNZ, pops, DIV, DAS ----
+        if col == 0xE:
+            if row == 0x0:
+                b1 = self._fetch8()
+                b2 = self._fetch8()
+                ad = b1 | (b2 << 8)
+                m = self.rd(ad)
+                d = (self.a - m) & 0xFF
+                self.n = (d >> 7) & 1
+                self.z = 1 if d == 0 else 0
+                self.wr(ad, m | self.a)
+                return 6
+            if row == 0x4:
+                b1 = self._fetch8()
+                b2 = self._fetch8()
+                ad = b1 | (b2 << 8)
+                m = self.rd(ad)
+                d = (self.a - m) & 0xFF
+                self.n = (d >> 7) & 1
+                self.z = 1 if d == 0 else 0
+                self.wr(ad, m & ~self.a & 0xFF)
+                return 6
+            if row == 0x1:
+                self._cmp(self.x, self.rd(self._fetch16())); return 4
+            if row == 0x3:
+                self._cmp(self.x, self.rd(self._dp_b(self._fetch8()))); return 3
+            if row == 0x5:
+                self._cmp(self.y, self.rd(self._fetch16())); return 4
+            if row == 0x7:
+                self._cmp(self.y, self.rd(self._dp_b(self._fetch8()))); return 3
+            if row == 0x2:
+                d = self._fetch8()
+                m = self.rd(self._dp_b(d))
+                off = self._fetch8()
+                if off & 0x80:
+                    off -= 256
+                if (self.a & 0xFF) != m:
+                    self.pc = (self.pc + off) & 0xFFFF
+                    return 7
+                return 5
+            if row == 0x6:
+                d = self._fetch8()
+                ad = self._dp_b(d)
+                v = (self.rd(ad) - 1) & 0xFF
+                self.wr(ad, v)
+                off = self._fetch8()
+                if off & 0x80:
+                    off -= 256
+                if v != 0:
+                    self.pc = (self.pc + off) & 0xFFFF
+                    return 7
+                return 5
+            if row == 0x8:
+                self.set_psw(self._pop()); return 4
+            if row == 0x9:
+                self._div(); return 12
+            if row == 0xA:
+                self.a = self._pop(); return 4
+            if row == 0xB:
+                self._das_fn(); return 3
+            if row == 0xC:
+                self.x = self._pop(); return 4
+            if row == 0xE:
+                self.y = self._pop(); return 4
+            if row == 0xD:
+                d = self._fetch8()
+                m = self.rd(self._dp_b((d + self.x) & 0xFF))
+                off = self._fetch8()
+                if off & 0x80:
+                    off -= 256
+                if (self.a & 0xFF) != m:
+                    self.pc = (self.pc + off) & 0xFFFF
+                    return 8
+                return 6
+            off = self.pcv()
+            self.y = (self.y - 1) & 0xFF
+            if self.y != 0:
+                self.pc = (self.pc + off) & 0xFFFF
+                return 6
+            return 4
+
+        # ---- Column xF: subroutines, MOV d,#i, XCN, (X)+, MUL, DAA ----
+        if col == 0xF:
+            if row == 0x0:
+                self._push16(self.pc)
+                self._push(self.get_psw())
+                self.b = 1
+                self.i = 0
+                self.pc = self.rd(0xFFDE) | (self.rd(0xFFDF) << 8)
+                return 8
+            if row == 0x1:
+                ad = (self._fetch16() + self.x) & 0xFFFF
+                self.pc = self.rd(ad) | (self.rd((ad + 1) & 0xFFFF) << 8)
+                return 6
+            if row == 0x2:
+                off = self._fetch8()
+                if off & 0x80:
+                    off -= 256
+                self.pc = (self.pc + off) & 0xFFFF
+                return 4
+            if row == 0x3:
+                ad = self._fetch16()
+                self._push16(self.pc)
+                self.pc = ad
+                return 8
+            if row == 0x4:
+                u = self._fetch8()
+                self._push16(self.pc)
+                self.pc = 0xFF00 | u
+                return 6
+            if row == 0x5:
+                self.pc = self._fetch16(); return 3
+            if row == 0x6:
+                self.pc = self._pop16(); return 5
+            if row == 0x7:
+                self.set_psw(self._pop())
+                self.pc = self._pop16(); return 6
+            if row == 0x8:
+                imm = self._fetch8()
+                ad = self._dp_b(self._fetch8())
+                self.wr(ad, imm); return 5
+            if row == 0x9:
+                self.a = self._nz(((self.a >> 4) | (self.a << 4)) & 0xFF); return 5
+            if row == 0xA:
+                self.wr(self.x & 0xFF, self.a)
+                self.x = (self.x + 1) & 0xFF
+                return 4
+            if row == 0xB:
+                self.a = self._nz(self.rd(self.x & 0xFF))
+                self.x = (self.x + 1) & 0xFF
+                return 4
+            if row == 0xC:
+                prod = self.y * self.a
+                yh = (prod >> 8) & 0xFF
+                self.y = yh
+                self.a = prod & 0xFF
+                self.n = 1 if yh & 0x80 else 0
+                self.z = 1 if yh == 0 else 0
+                return 9
+            if row == 0xD:
+                self._daa_fn(); return 3
+            if row == 0xE:
+                self.sleeping = True; return 3
+            self.halted = True; return 3
+
+        return 2
+
+    def pcv(self):
+        off = self._fetch8()
+        if off & 0x80:
+            off -= 256
+        return off
+
+    def _div(self):
+        yva = (self.y << 8) | self.a
+        x9 = (self.x & 0xFF) << 9
+        for _ in range(9):
+            yva <<= 1
+            if yva & 0x20000:
+                yva = (yva & 0x1FFFF) | 1
+            if yva >= x9:
+                yva ^= 1
+            if yva & 1:
+                yva = (yva - x9) & 0x1FFFF
+        self.y = (yva >> 9) & 0xFF
+        self.a = yva & 0xFF
+        self.v = (yva >> 8) & 1
+        self.h = 1 if (self.x & 0x0F) <= (self.a & 0x0F) else 0
+        self.n = 1 if self.a & 0x80 else 0
+        self.z = 1 if self.a == 0 else 0
+
+    def _daa_fn(self):
+        a = self.a & 0xFF
+        adj = 0
+        if a > 0x99 or self.c:
+            adj |= 0x60
+            self.c = 1
+        if (a & 0x0F) > 9 or self.h:
+            adj |= 0x06
+        self.a = self._nz((a + adj) & 0xFF)
+
+    def _das_fn(self):
+        a = self.a & 0xFF
+        adj = 0
+        if a > 0x99 or not self.c:
+            adj |= 0x60
+            self.c = 0
+        if (a & 0x0F) > 9 or not self.h:
+            adj |= 0x06
+        self.a = self._nz((a - adj) & 0xFF)
+
+    def get_state(self):
+        return {
+            "ram": bytes(self.ram),
+            "a": self.a, "x": self.x, "y": self.y, "sp": self.sp, "pc": self.pc,
+            "psw": self.get_psw(), "test": self.test, "control": self.control,
+            "dsp_addr": self.dsp_addr,
+            "cpui": list(self.cpui), "cpuo": list(self.cpuo),
+            "cpuo_pending": [list(q) for q in self.cpuo_pending],
+            "t_targets": list(self.t_targets), "t_enable": list(self.t_enable),
+            "t_cnt": list(self.t_cnt), "t_out": list(self.t_out),
+            "cycle": self.cycle,
+            "dsp_regs": bytes(self.dsp.reg),
+            "dsp_brr_addr": list(self.dsp.brr_addr),
+            "dsp_v_pos": list(self.dsp.v_pos),
+            "dsp_v_p1": list(self.dsp.v_p1), "dsp_v_p2": list(self.dsp.v_p2),
+            "dsp_v_env": list(self.dsp.v_env), "dsp_v_cnt": list(self.dsp.v_cnt),
+            "dsp_v_evt": list(self.dsp.v_evt), "dsp_v_rate": list(self.dsp.v_rate),
+            "dsp_v_state": bytes(self.dsp.v_state),
+            "dsp_v_out": list(self.dsp.v_out),
+            "dsp_noise": self.dsp.noise,
+            "dsp_echo_len": self.dsp.echo_len, "dsp_echo_pos": self.dsp.echo_pos,
+        }
+
+    def set_state(self, st):
+        self.ram[:] = st["ram"]
+        self.a, self.x, self.y = st["a"], st["x"], st["y"]
+        self.sp, self.pc = st["sp"], st["pc"]
+        self.set_psw(st["psw"])
+        self.test = st["test"]
+        self.control = st["control"]
+        self.dsp_addr = st["dsp_addr"]
+        self.cpui[:] = st["cpui"]; self.cpuo[:] = st["cpuo"]
+        self.cpuo_pending = [list(q) for q in st.get("cpuo_pending", ([], [], [], []))]
+        self.t_targets[:] = st["t_targets"]; self.t_enable[:] = st["t_enable"]
+        self.t_cnt[:] = st["t_cnt"]; self.t_out[:] = st["t_out"]
+        self.cycle = st["cycle"]
+        d = self.dsp
+        d.reg[:] = st["dsp_regs"]
+        d.brr_addr[:] = st["dsp_brr_addr"]
+        d.v_pos[:] = st["dsp_v_pos"]
+        d.v_p1[:] = st["dsp_v_p1"]; d.v_p2[:] = st["dsp_v_p2"]
+        d.v_env[:] = st["dsp_v_env"]; d.v_cnt[:] = st["dsp_v_cnt"]
+        d.v_evt[:] = st["dsp_v_evt"]; d.v_rate[:] = st["dsp_v_rate"]
+        d.v_state[:] = st["dsp_v_state"]
+        d.v_out[:] = st["dsp_v_out"]
+        d.noise = st["dsp_noise"]
+        d.echo_len = st["dsp_echo_len"]; d.echo_pos = st["dsp_echo_pos"]
 
 
 class SNESBus:
@@ -4411,6 +5671,9 @@ class SNES:
         self.bus = SNESBus(self.cart, self.ppu, self.apu)
         self.cpu = CPU65c816(self.bus)
         self.bus.cpu = self.cpu
+        self.spc = SSMP()
+        self.spc.out_rate = float(sample_rate)
+        self.apu.core = self.spc
         self.frames = 0
         self._load_battery()
         self.cpu.reset()
@@ -4491,6 +5754,8 @@ class SNES:
             "apu_phase": apu.phase.copy(), "apu_freqs": apu.freqs.copy(),
             "apu_amps": apu.amps.copy(), "apu_note_decay": apu.note_decay.copy(),
             "apu_acc": apu.acc, "apu_dc": apu.dc, "apu_irq": apu.irq,
+            # Real SPC700/S-DSP core state
+            "spc": self.spc.get_state(),
             "frames": self.frames,
         }
 
@@ -4569,6 +5834,8 @@ class SNES:
             apu.acc = st.get("apu_acc", 0.0)
             apu.dc = st.get("apu_dc", 0.0)
             apu.irq = st.get("apu_irq", False)
+        if "spc" in st:
+            self.spc.set_state(st["spc"])
         self.frames = st.get("frames", self.frames)
 
     def save_state(self, path=None):
@@ -4655,6 +5922,9 @@ class SNES:
                         cpu.cycles = min(target, cpu.cycles + 4)
                         continue
                 step()
+
+            # S-SMP clocking: ~1024kHz/15750 line slots ~ 65 SPC cycles per line
+            self.spc.run(_PYSNES_SPC_CYCLES_PER_LINE)
 
             # HBlank of this line: run HDMA for the NEXT line, then snapshot
             # that line's PPU state so the render (below) uses it.
