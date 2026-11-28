@@ -2248,6 +2248,16 @@ class SNESPPU:
         self.v_latch = 0
         self.ophct_flip = 0
         self.opvct_flip = 0
+        # $4201 write latch and H/V counter status
+        self.io_port_output = 0
+        self.ppu1_open = 0
+        self.ppu2_open = 0
+        self.time_over = 0
+        self.range_over = 0
+        self.odd_frame = 0
+        self.location_latched = 0
+        self.h_counter = 0
+        self.v_counter = 0
         self.m7_latch = 0
         self.m7a = 0x0100
         self.m7b = 0
@@ -2256,6 +2266,12 @@ class SNESPPU:
         self.m7x = 0
         self.m7y = 0
         self.mpy_result = 0
+
+    def latch_location(self):
+        """Capture the current H/V counters ($4201.7 high-to-low)."""
+        self.h_latch = self.h_counter & 0x1FF
+        self.v_latch = self.v_counter & 0x1FF
+        self.location_latched = 1
 
     def _vram_step(self):
         return (1, 32, 128, 128)[self.vmain & 3]
@@ -2279,8 +2295,12 @@ class SNESPPU:
         elif addr == 0x2136:
             return (self.mpy_result >> 16) & 0xFF
         elif addr == 0x2137:
-            self.h_latch = (self.h_latch + 43) & 0x1FF
-            return 0
+            # Reads return open bus; latching only happens via $4201.7.
+            if self.io_port_output & 0x80:
+                self.h_latch = self.h_counter & 0x1FF
+                self.v_latch = self.v_counter & 0x1FF
+                self.location_latched = 1
+            return self.ppu2_open
         elif addr == 0x2138:
             a = self.oam_addr
             if a >= 0x200:
@@ -2307,19 +2327,28 @@ class SNESPPU:
             self.cgadd = (self.cgadd + 1) & 0x1FF
             return val
         elif addr == 0x213C:
-            val = (self.h_latch >> (8 * self.ophct_flip)) & 0xFF
-            self.ophct_flip ^= 1
-            return val
+            if self.ophct_flip == 0:
+                self.ophct_flip = 1
+                return self.ppu2_open
+            self.ophct_flip = 0
+            return (self.ppu2_open & 0xFE) | ((self.h_latch >> 8) & 1)
         elif addr == 0x213D:
-            val = (self.v_latch >> (8 * self.opvct_flip)) & 0xFF
-            self.opvct_flip ^= 1
-            return val
+            if self.opvct_flip == 0:
+                self.opvct_flip = 1
+                return self.ppu2_open
+            self.opvct_flip = 0
+            return (self.ppu2_open & 0xFE) | ((self.v_latch >> 8) & 1)
         elif addr == 0x213E:
-            return 0x01
+            return ((self.time_over & 0x01) << 7) | ((self.range_over & 0x01) << 6) \
+                | (self.ppu1_open & 0x1E) | 0x01  # version bits 1,0 = 01
         elif addr == 0x213F:
+            val = ((self.odd_frame & 1) << 7) | ((self.location_latched & 1) << 5) \
+                | (self.ppu2_open & 0x20) | 0x03  # NTSC, version 3
             self.ophct_flip = 0
             self.opvct_flip = 0
-            return 0x01
+            if self.io_port_output & 0x80:
+                self.location_latched = 0
+            return val
         return 0
 
     def write_reg(self, addr, val):
@@ -2352,12 +2381,23 @@ class SNESPPU:
             self.bg_sc[addr - 0x2107] = val
         elif addr in (0x210B, 0x210C):
             self.bg_nba[addr - 0x210B] = val
-        elif 0x210D <= addr <= 0x2114:
+        elif addr in (0x210D, 0x210F, 0x2111, 0x2113):
+            # BG1-4 HOFS: low byte then high byte. $210D also sets M7HOFS.
             idx = (addr - 0x210D) >> 1
-            if (addr & 1) == 1:
-                self.bg_hofs[idx] = ((val << 8) | (self.bg_prev & ~7) | ((self.bg_hofs[idx] >> 8) & 7)) & 0x3FF
-            else:
-                self.bg_vofs[idx] = ((val << 8) | self.bg_prev) & 0x3FF
+            self.bg_hofs[idx] = ((val << 8) | (self.bg_prev & ~7)
+                                 | ((self.bg_hofs[idx] >> 8) & 7)) & 0x3FF
+            if addr == 0x210D:
+                self.m7x = ((val << 8) | self.m7_latch) & 0x1FFF
+                self.m7_latch = val
+            self.bg_prev = val
+        elif addr in (0x210E, 0x2110, 0x2112, 0x2114):
+            # BG1-4 VOFS: low byte then high byte. $210E also sets M7VOFS.
+            idx = (addr - 0x210E) >> 1
+            # VOFS is only 9 bits; bit 0 of the high-byte write is bit 8.
+            self.bg_vofs[idx] = ((val << 8) | self.bg_prev) & 0x1FF
+            if addr == 0x210E:
+                self.m7y = ((val << 8) | self.m7_latch) & 0x1FFF
+                self.m7_latch = val
             self.bg_prev = val
         elif addr == 0x2115:
             self.vmain = val
@@ -3085,6 +3125,11 @@ _SPC_RATE = (2048, 1536, 1280, 1024, 768, 640, 512, 384, 320, 256, 192, 160,
              128, 96, 80, 64, 48, 40, 32, 24, 20, 16, 12, 10, 8, 6, 5, 4, 3,
              2, 1, 1)
 
+# S-DSP noise clock period for FLG bits 0-4 (0 = 32kHz step).
+_NOISE_RATE = (65535, 2048, 1536, 1280, 1024, 768, 640, 512, 384, 320, 256,
+               192, 160, 128, 96, 80, 64, 48, 40, 32, 24, 20, 16, 12, 10, 8,
+               6, 5, 4, 3, 2, 1)
+
 
 class SDSP:
     """S-DSP: 8 BRR voices, ADSR/GAIN envelope, pitch modulation, echo."""
@@ -3106,6 +3151,8 @@ class SDSP:
         self.v_state = bytearray(8)
         self.v_out = [0] * 8
         self.noise = 0x4000
+        self.noise_cnt = 0
+        self.noise_rate = _NOISE_RATE[0]
         self.echo_l = [0.0] * 7680
         self.echo_r = [0.0] * 7680
         self.echo_pos = 0
@@ -3125,6 +3172,9 @@ class SDSP:
             self.reg[0x6C] = 0xE0 if (v & 0x40) else 0xA0
             return
         self.reg[addr] = v
+        if addr == 0x6C:
+            self.noise_rate = _NOISE_RATE[v & 0x1F]
+            self.noise_cnt = 0
         if addr == 0x4C:
             for i in range(8):
                 if v & (1 << i):
@@ -3311,13 +3361,13 @@ class SDSP:
                     self.noise_cnt += 1
                     if self.noise_cnt >= self.noise_rate:
                         self.noise_cnt = 0
-                        fb = ((self.noise >> 14) ^ (self.noise >> 15)) & 1
-                        self.noise = ((self.noise << 1) | fb) & 0x7FFF
+                        new_bit = ((self.noise << 14) ^ (self.noise << 13)) & 0x4000
+                        self.noise = new_bit ^ (self.noise >> 1)
                 smp = self.noise if self.noise < 0x8000 else self.noise - 0x10000
                 smp >>= 1
             else:
                 if v and (reg[0x2D] >> v) & 1:
-                    p += ((self.v_out[v - 1] * p) >> 11) & ~0x3FFF
+                    p += ((self.v_out[v - 1] >> 5) * p) >> 10
                     p &= 0x3FFF
                 self.v_cnt[v] += max(1, p)
                 if self.v_cnt[v] >= 0x1000:
@@ -4280,6 +4330,7 @@ class SSMP:
             "t_targets": list(self.t_targets), "t_enable": list(self.t_enable),
             "t_cnt": list(self.t_cnt), "t_out": list(self.t_out),
             "cycle": self.cycle,
+            "sleeping": self.sleeping, "halted": self.halted, "_left": self._left,
             "dsp_regs": bytes(self.dsp.reg),
             "dsp_brr_addr": list(self.dsp.brr_addr),
             "dsp_v_pos": list(self.dsp.v_pos),
@@ -4289,6 +4340,9 @@ class SSMP:
             "dsp_v_state": bytes(self.dsp.v_state),
             "dsp_v_out": list(self.dsp.v_out),
             "dsp_noise": self.dsp.noise,
+            "dsp_noise_cnt": self.dsp.noise_cnt, "dsp_noise_rate": self.dsp.noise_rate,
+            "dsp_dec": [row[:] for row in self.dsp.dec],
+            "dsp_echo_l": list(self.dsp.echo_l), "dsp_echo_r": list(self.dsp.echo_r),
             "dsp_echo_len": self.dsp.echo_len, "dsp_echo_pos": self.dsp.echo_pos,
         }
 
@@ -4305,6 +4359,9 @@ class SSMP:
         self.t_targets[:] = st["t_targets"]; self.t_enable[:] = st["t_enable"]
         self.t_cnt[:] = st["t_cnt"]; self.t_out[:] = st["t_out"]
         self.cycle = st["cycle"]
+        self.sleeping = st.get("sleeping", False)
+        self.halted = st.get("halted", False)
+        self._left = st.get("_left", 0.0)
         d = self.dsp
         d.reg[:] = st["dsp_regs"]
         d.brr_addr[:] = st["dsp_brr_addr"]
@@ -4315,6 +4372,14 @@ class SSMP:
         d.v_state[:] = st["dsp_v_state"]
         d.v_out[:] = st["dsp_v_out"]
         d.noise = st["dsp_noise"]
+        d.noise_cnt = st.get("dsp_noise_cnt", 0)
+        d.noise_rate = st.get("dsp_noise_rate", d.noise_rate)
+        if "dsp_dec" in st:
+            d.dec[:] = [row[:] for row in st["dsp_dec"]]
+        if "dsp_echo_l" in st:
+            d.echo_l[:] = st["dsp_echo_l"]
+        if "dsp_echo_r" in st:
+            d.echo_r[:] = st["dsp_echo_r"]
         d.echo_len = st["dsp_echo_len"]; d.echo_pos = st["dsp_echo_pos"]
 
 
@@ -4346,6 +4411,12 @@ class SNESBus:
         self.joy_shift1 = 0
         self.joy_shift2 = 0
         self.joy_strobe = 0
+        # Auto-joypad ($4200.0): four 16-bit controller words, shifted during VBlank
+        self.joy_live = [0, 0, 0, 0]
+        self.auto_read = 0
+        self.joy_words = [0xFFFF] * 4
+        self.joy_bit = 0
+        self.auto_active = False
         self.cpu = None
         self.timeup = 0
         self.htime = 0
@@ -4405,20 +4476,15 @@ class SNESBus:
                     into = (self.cpu.cycles - self._line_base) % cpl
                 if v or into >= int(cpl * _PYSNES_HBLANK_FRAC):
                     v |= 0x40
-                # Auto-joypad busy for the first few VBlank lines when enabled.
-                if v & 0x80 and getattr(self, "_vblank_line", 999) < 4 and (self.ppu.nmitimen & 1):
+                if self.auto_active:
                     v |= 0x01
                 return v
             if 0x4214 <= addr <= 0x4217:
                 return (self.rddiv & 0xFF, self.rddiv >> 8, self.rdmpy & 0xFF, self.rdmpy >> 8)[addr - 0x4214]
-            if addr == 0x4218:
-                return self.joy1 & 0xFF
-            if addr == 0x4219:
-                return (self.joy1 >> 8) & 0xFF
-            if addr == 0x421A:
-                return self.joy2 & 0xFF
-            if addr == 0x421B:
-                return (self.joy2 >> 8) & 0xFF
+            if 0x4218 <= addr <= 0x421F:
+                idx = (addr - 0x4218) >> 1
+                w = self.joy_words[idx]
+                return (w & 0xFF) if (addr & 1) == 0 else ((w >> 8) & 0xFF)
             if 0x4300 <= addr <= 0x437F:
                 return self.dma_regs[addr - 0x4300]
 
@@ -4489,9 +4555,18 @@ class SNESBus:
                 return
             if addr == 0x4200:
                 old = self.ppu.nmitimen
-                self.ppu.nmitimen = val
+                self.ppu.nmitimen = val & 0x8F
+                self.auto_read = val & 0x01
+                if not self.auto_read:
+                    self.auto_active = False
                 if (val & 0x80) and not (old & 0x80) and (self.ppu.rdnmi & 0x80) and self.cpu is not None:
                     self.cpu.nmi_pending = True
+                return
+            if addr == 0x4201:
+                old7 = self.ppu.io_port_output & 0x80
+                self.ppu.io_port_output = val
+                if old7 and not (val & 0x80):
+                    self.ppu.latch_location()
                 return
             if addr == 0x4202:
                 self.wrmpya = val
@@ -4772,18 +4847,28 @@ class CPU65c816:
         hi = self._fetch8()
         return hi, (mid << 8) | lo
 
+    def _next16(self, bank, addr):
+        # Native-mode 16-bit accesses carry into the next bank; emulation
+        # mode wraps the 16-bit address within the same bank.
+        if self.e:
+            return bank, (addr + 1) & 0xFFFF
+        full = ((bank << 16) + addr + 1) & 0xFFFFFF
+        return full >> 16, full & 0xFFFF
+
     def _read16(self, bank, addr):
+        b2, a2 = self._next16(bank, addr)
         if bank <= 0x7D and (addr >= 0x8000 or 0x40 <= bank <= 0x6F):
             lo = self._rom_byte(bank, addr)
-            hi = self._rom_byte(bank, (addr + 1) & 0xFFFF)
+            hi = self._rom_byte(b2, a2)
             return lo | (hi << 8)
         lo = self.bus.read(bank, addr)
-        hi = self.bus.read(bank, (addr + 1) & 0xFFFF)
+        hi = self.bus.read(b2, a2)
         return lo | (hi << 8)
 
     def _write16(self, bank, addr, val):
         self.bus.write(bank, addr, val & 0xFF)
-        self.bus.write(bank, (addr + 1) & 0xFFFF, (val >> 8) & 0xFF)
+        b2, a2 = self._next16(bank, addr)
+        self.bus.write(b2, a2, (val >> 8) & 0xFF)
 
     def push8(self, v):
         self.bus.write(0, self.sp, v & 0xFF)
@@ -4892,27 +4977,44 @@ class CPU65c816:
         else:
             self._write16(bank, addr, self.y)
 
-    def _adc_val(self, m):
-        if self.m_flag:
-            a = self.a & 0xFF
-            s = a + (m & 0xFF) + self.c
-            self.v = 1 if (~(a ^ m) & (a ^ s) & 0x80) else 0
-            self.c = 1 if s > 0xFF else 0
-            self.a = (self.a & 0xFF00) | (s & 0xFF)
-            self._nz8(s)
+    def _arith_val(self, m, sub):
+        mask = 0xFF if self.m_flag else 0xFFFF
+        sign = 0x80 if self.m_flag else 0x8000
+        a, cin = self.a & mask, self.c
+        m &= mask
+        if sub:
+            m ^= mask
+        if self.dec:
+            r = (a & 0x0F) + (m & 0x0F) + cin
+            r += (-6 if sub and r <= 0x0F else (6 if not sub and r > 9 else 0))
+            r = (a & 0xF0) + (m & 0xF0) + (0x10 if r > 0x0F else 0) + (r & 0x0F)
+            if mask == 0xFFFF:
+                r += (-0x60 if sub and r <= 0xFF else (0x60 if not sub and r > 0x9F else 0))
+                r = (a & 0xF00) + (m & 0xF00) + (0x100 if r > 0xFF else 0) + (r & 0xFF)
+                r += (-0x600 if sub and r <= 0xFFF else (0x600 if not sub and r > 0x9FF else 0))
+                r = (a & 0xF000) + (m & 0xF000) + (0x1000 if r > 0xFFF else 0) + (r & 0xFFF)
+                pre_v_result = r
+                r += (-0x6000 if sub and r <= 0xFFFF else (0x6000 if not sub and r > 0x9FFF else 0))
+            else:
+                pre_v_result = r
+                r += (-0x60 if sub and r <= 0xFF else (0x60 if not sub and r > 0x9F else 0))
         else:
-            a = self.a
-            s = a + (m & 0xFFFF) + self.c
-            self.v = 1 if (~(a ^ m) & (a ^ s) & 0x8000) else 0
-            self.c = 1 if s > 0xFFFF else 0
-            self.a = s & 0xFFFF
-            self._nz16(self.a)
+            pre_v_result = r = a + m + cin
+        self.v = int(bool(~(a ^ m) & (a ^ pre_v_result) & sign))
+        self.c = int(r > mask)
+        r &= mask
+        if self.m_flag:
+            self.a = (self.a & 0xFF00) | r
+            self._nz8(r)
+        else:
+            self.a = r
+            self._nz16(r)
+
+    def _adc_val(self, m):
+        self._arith_val(m, False)
 
     def _sbc_val(self, m):
-        if self.m_flag:
-            self._adc_val((m ^ 0xFF) & 0xFF)
-        else:
-            self._adc_val((m ^ 0xFFFF) & 0xFFFF)
+        self._arith_val(m, True)
 
     def _cmp_val(self, reg, m, is8):
         if is8:
@@ -4968,7 +5070,8 @@ class CPU65c816:
         elif op_low == 0x0E:
             return self.dbr, self._fetch16()
         else:
-            return self.dbr, (self._fetch16() + self.x) & 0xFFFF
+            full = ((self.dbr << 16) + self._fetch16() + self.x) & 0xFFFFFF
+            return full >> 16, full & 0xFFFF
 
     def _addr_alu(self, mode_bits):
         """Resolve (bank, addr) for standard 8-mode ALU instructions (ORA, AND, EOR, ADC, STA, LDA, CMP, SBC)."""
@@ -5098,13 +5201,14 @@ class CPU65c816:
             return 3
 
         def bit_abx():
-            ad = (f16() + cpu.x) & 0xFFFF
+            full = ((cpu.dbr << 16) + f16() + cpu.x) & 0xFFFFFF
+            b, ad = full >> 16, full & 0xFFFF
             if cpu.m_flag:
-                m = rd(cpu.dbr, ad)
+                m = rd(b, ad)
                 cpu.z = int(((cpu.a & 0xFF) & m) == 0)
                 cpu.n = (m >> 7) & 1; cpu.v = (m >> 6) & 1
             else:
-                m = cpu._read16(cpu.dbr, ad)
+                m = cpu._read16(b, ad)
                 cpu.z = int((cpu.a & m) == 0)
                 cpu.n = (m >> 15) & 1; cpu.v = (m >> 14) & 1
             cpu.cycles += 4
@@ -5439,7 +5543,9 @@ class CPU65c816:
             if op == 0x64: b, ad = 0, (self.d + self._fetch8()) & 0xFFFF
             elif op == 0x74: b, ad = 0, (self.d + self._fetch8() + self.x) & 0xFFFF
             elif op == 0x9C: b, ad = self.dbr, self._fetch16()
-            else: b, ad = self.dbr, (self._fetch16() + self.x) & 0xFFFF
+            else:
+                full = ((self.dbr << 16) + self._fetch16() + self.x) & 0xFFFFFF
+                b, ad = full >> 16, full & 0xFFFF
             if self.m_flag: self.bus.write(b, ad, 0)
             else: self._write16(b, ad, 0)
 
@@ -5463,7 +5569,9 @@ class CPU65c816:
         elif op == 0xA6: self._ldx_val(0, (self.d + self._fetch8()) & 0xFFFF)
         elif op == 0xB6: self._ldx_val(0, (self.d + self._fetch8() + self.y) & 0xFFFF)
         elif op == 0xAE: self._ldx_val(self.dbr, self._fetch16())
-        elif op == 0xBE: self._ldx_val(self.dbr, (self._fetch16() + self.y) & 0xFFFF)
+        elif op == 0xBE:
+            full = ((self.dbr << 16) + self._fetch16() + self.y) & 0xFFFFFF
+            self._ldx_val(full >> 16, full & 0xFFFF)
         elif op == 0x86: self._stx_val(0, (self.d + self._fetch8()) & 0xFFFF)
         elif op == 0x96: self._stx_val(0, (self.d + self._fetch8() + self.y) & 0xFFFF)
         elif op == 0x8E: self._stx_val(self.dbr, self._fetch16())
@@ -5474,7 +5582,9 @@ class CPU65c816:
         elif op == 0xA4: self._ldy_val(0, (self.d + self._fetch8()) & 0xFFFF)
         elif op == 0xB4: self._ldy_val(0, (self.d + self._fetch8() + self.x) & 0xFFFF)
         elif op == 0xAC: self._ldy_val(self.dbr, self._fetch16())
-        elif op == 0xBC: self._ldy_val(self.dbr, (self._fetch16() + self.x) & 0xFFFF)
+        elif op == 0xBC:
+            full = ((self.dbr << 16) + self._fetch16() + self.x) & 0xFFFFFF
+            self._ldy_val(full >> 16, full & 0xFFFF)
         elif op == 0x84: self._sty_val(0, (self.d + self._fetch8()) & 0xFFFF)
         elif op == 0x94: self._sty_val(0, (self.d + self._fetch8() + self.x) & 0xFFFF)
         elif op == 0x8C: self._sty_val(self.dbr, self._fetch16())
@@ -5563,7 +5673,9 @@ class CPU65c816:
             if op == 0x24: b, ad = 0, (self.d + self._fetch8()) & 0xFFFF; cyc = 3
             elif op == 0x34: b, ad = 0, (self.d + self._fetch8() + self.x) & 0xFFFF; cyc = 4
             elif op == 0x2C: b, ad = self.dbr, self._fetch16(); cyc = 4
-            else: b, ad = self.dbr, (self._fetch16() + self.x) & 0xFFFF; cyc = 4
+            else:
+                full = ((self.dbr << 16) + self._fetch16() + self.x) & 0xFFFFFF
+                b, ad = full >> 16, full & 0xFFFF; cyc = 4
             if self.m_flag:
                 m = self.bus.read(b, ad)
                 self.z = int(((self.a & 0xFF) & m) == 0)
@@ -5724,6 +5836,10 @@ class SNES:
             "joy1": bus.joy1, "joy2": bus.joy2,
             "joy_shift1": bus.joy_shift1, "joy_shift2": bus.joy_shift2,
             "joy_strobe": bus.joy_strobe, "timeup": bus.timeup,
+            "htime": bus.htime, "vtime": bus.vtime,
+            "joy_live": list(bus.joy_live), "auto_read": bus.auto_read,
+            "joy_words": list(bus.joy_words), "joy_bit": bus.joy_bit,
+            "auto_active": bus.auto_active,
             "hdma_cur": list(bus._hdma_cur), "hdma_cnt": list(bus._hdma_cnt),
             # PPU (all registers that affect rendering / timing)
             "vram": bytes(ppu.vram), "cgram": bytes(ppu.cgram), "oam": bytes(ppu.oam),
@@ -5744,6 +5860,11 @@ class SNES:
             "nmitimen": ppu.nmitimen, "rdnmi": ppu.rdnmi, "hvbjoy": ppu.hvbjoy,
             "h_latch": ppu.h_latch, "v_latch": ppu.v_latch,
             "ophct_flip": ppu.ophct_flip, "opvct_flip": ppu.opvct_flip,
+            "io_port_output": ppu.io_port_output,
+            "ppu1_open": ppu.ppu1_open, "ppu2_open": ppu.ppu2_open,
+            "time_over": ppu.time_over, "range_over": ppu.range_over,
+            "odd_frame": ppu.odd_frame, "location_latched": ppu.location_latched,
+            "h_counter": ppu.h_counter, "v_counter": ppu.v_counter,
             "m7_latch": ppu.m7_latch, "m7a": ppu.m7a, "m7b": ppu.m7b,
             "m7c": ppu.m7c, "m7d": ppu.m7d, "m7x": ppu.m7x, "m7y": ppu.m7y,
             "mpy_result": ppu.mpy_result,
@@ -5788,12 +5909,20 @@ class SNES:
         bus.joy_shift2 = st.get("joy_shift2", 0)
         bus.joy_strobe = st.get("joy_strobe", 0)
         bus.timeup = st.get("timeup", 0)
+        bus.htime = st.get("htime", 0)
+        bus.vtime = st.get("vtime", 0)
+        if "joy_live" in st:
+            bus.joy_live[:] = st["joy_live"]
+        bus.auto_read = st.get("auto_read", 0)
+        if "joy_words" in st:
+            bus.joy_words[:] = st["joy_words"]
+        bus.joy_bit = st.get("joy_bit", 0)
+        bus.auto_active = st.get("auto_active", False)
         if "hdma_cur" in st:
             bus._hdma_cur[:] = st["hdma_cur"]
         if "hdma_cnt" in st:
             bus._hdma_cnt[:] = st["hdma_cnt"]
         bus._line_base = cpu.cycles
-        bus.mdmaen = 0
         # PPU
         ppu.vram[:] = st["vram"]
         ppu.cgram[:] = st["cgram"]
@@ -5805,6 +5934,9 @@ class SNES:
             "w12sel", "w34sel", "wobjsel", "wh0", "wh1", "wh2", "wh3",
             "wbglog", "wobjlog", "tmw", "tsw", "nmitimen", "rdnmi", "hvbjoy",
             "h_latch", "v_latch", "ophct_flip", "opvct_flip",
+            "io_port_output", "ppu1_open", "ppu2_open", "time_over",
+            "range_over", "odd_frame", "location_latched", "h_counter",
+            "v_counter",
             "m7_latch", "m7a", "m7b", "m7c", "m7d", "m7x", "m7y", "mpy_result",
         ):
             if attr in st:
@@ -5852,6 +5984,45 @@ class SNES:
         return True
 
     def reset(self):
+        # Hardware reset preserves VRAM/WRAM/SRAM but clears live runtime
+        # state (DMA, internal registers, joypads and the APU core).
+        ppu, bus, apu = self.ppu, self.bus, self.apu
+        ppu.inidisp = 0x8F
+        ppu.bgmode = ppu.mosaic = 0
+        ppu.tm = ppu.ts = 0
+        ppu.nmitimen = ppu.rdnmi = ppu.hvbjoy = 0
+        ppu.h_latch = ppu.v_latch = 0
+        ppu.h_counter = ppu.v_counter = 0
+        ppu.ophct_flip = ppu.opvct_flip = 0
+        ppu.io_port_output = 0
+        ppu.time_over = ppu.range_over = 0
+        ppu.odd_frame = ppu.location_latched = 0
+        ppu.ppu1_open = ppu.ppu2_open = 0
+        bus.mdmaen = bus.hdmaen = 0
+        bus.dma_regs[:] = b"\x00" * len(bus.dma_regs)
+        bus.wmadd = 0
+        bus.wrmpya, bus.wrmpyb = 0xFF, 0
+        bus.wrdiv, bus.wrdivb = 0xFFFF, 0
+        bus.rddiv = bus.rdmpy = 0
+        bus.joy1 = bus.joy2 = 0
+        bus.joy_shift1 = bus.joy_shift2 = 0
+        bus.joy_strobe = 0
+        bus.joy_live = [0, 0, 0, 0]
+        bus.auto_read = 0
+        bus.joy_words = [0xFFFF] * 4
+        bus.joy_bit = 0
+        bus.auto_active = False
+        bus.timeup = bus.htime = bus.vtime = 0
+        bus._vblank_line = 999
+        apu.ports_in[:] = [0, 0, 0, 0]
+        apu.ports_out[:] = [0xAA, 0xBB, 0, 0]
+        apu.read_polls[:] = [0, 0, 0, 0]
+        apu.acc = apu.dc = 0.0
+        apu.irq = False
+        apu.boot_step = 0
+        self.spc = SSMP()
+        self.spc.out_rate = float(apu.sr)
+        apu.core = self.spc
         self.cpu.reset()
         self._skip_boot_blank()
 
@@ -5868,6 +6039,7 @@ class SNES:
         if buttons & BTN_RIGHT:  snes_joy |= 0x0100
         if buttons & BTN_A:      snes_joy |= 0x0080
         self.bus.joy1 = snes_joy
+        self.bus.joy_live[0] = snes_joy
 
     def _snapshot_row_state(self):
         """Render-relevant PPU state for one scanline (HDMA/raster effects)."""
@@ -5890,6 +6062,8 @@ class SNES:
             bus._cycles_per_line = cpl
             bus._line_base = cpu.cycles
             ppu.v_latch = sl
+            ppu.v_counter = sl % 262
+            ppu.h_counter = 0
             bus._vblank_line = (sl - 225) if sl >= 225 else 999
 
             # VBlank edge a few dots into line 225
@@ -5901,9 +6075,20 @@ class SNES:
                 ppu.rdnmi |= 0x80
                 if ppu.nmitimen & 0x80:
                     cpu.nmi_pending = True
+                if bus.auto_read:
+                    bus.joy_words = [(~w) & 0xFFFF for w in bus.joy_live]
+                    bus.joy_bit = 0
+                    bus.auto_active = True
             elif sl == 0:
                 ppu.hvbjoy &= ~0x80
                 ppu.rdnmi &= ~0x80
+            if bus.auto_active and sl >= 225:
+                if bus.joy_bit < 16:
+                    for i in range(4):
+                        bus.joy_words[i] = ((bus.joy_words[i] >> 1) | 0x8000) & 0xFFFF
+                    bus.joy_bit += 1
+                else:
+                    bus.auto_active = False
 
             # IRQ from HTIME/VTIME
             if (ppu.nmitimen & 0x30) and sl == bus.vtime:
@@ -5913,6 +6098,9 @@ class SNES:
 
             target = cpu.cycles + cpl
             while cpu.cycles < target:
+                # Keep the PPU H counter tied to CPU dots so $4201.7 latches
+                # the real horizontal position instead of a fabricated one.
+                ppu.h_counter = min(339, (cpu.cycles - bus._line_base) * 6 // 4)
                 if cpu.waiting:
                     # WAI sleeps, but the clock keeps running so $4212 HBlank
                     # still sets and pending NMI/IRQ wake the CPU mid-line.
@@ -9986,6 +10174,8 @@ class Nintendo64:
         self.rsp_cmds = 0
         self.rsp_tris = 0
         self._irq_active = False
+        self._in_delay_slot = False
+        self._ai_full = False
         self._rsp_reset_state()
 
         self.buttons = 0
@@ -10037,6 +10227,8 @@ class Nintendo64:
         self.mi_regs[2] = 0
         self.sp_regs[4] = 0x0001
         self._irq_active = False
+        self._in_delay_slot = False
+        self._ai_full = False
         self._rsp_reset_state()
         self._opmiss_hist = {}
         self._opmiss_first = []
@@ -10074,25 +10266,43 @@ class Nintendo64:
         cmp_v = self.cp0[11]
         if cmp_v and ((self.cp0[9] - cmp_v) & 0xFFFFFFFF) < 0x80000000:
             ips |= 0x8000                  # Count >= Compare -> IP7
-        self.cp0[13] = (self.cp0[13] & ~0x7C00) | ips | (self.cp0[13] & 0x0300)
+        # Cause IP7..IP2 are hardware interrupt lines; IP1/IP0 are software
+        # writes and must be preserved across updates.
+        self.cp0[13] = (self.cp0[13] & ~0xFF00) | ips | (self.cp0[13] & 0x0300)
+
+    def _si_raise_irq(self):
+        self.si_regs[6] |= 0x1000
+        self.mi_regs[2] |= 0x02
+        self._mi_update()
+        self._irq_eval()
+
+    def _si_clear_irq(self):
+        self.si_regs[6] &= ~0x1000
+        self.mi_regs[2] &= ~0x02
+        self._mi_update()
+        self._irq_eval()
 
     def _irq_eval(self):
         sr = self.cp0[12]
         self._irq_active = bool(
             (sr & 0x1) and (sr & 0x6) == 0
-            and self.cp0[13] & (((sr >> 8) & 0xFF) << 8) & 0x7C00)
+            and self.cp0[13] & (((sr >> 8) & 0xFF) << 8) & 0xFF00)
 
     def _take_irq(self):
         self._irq_active = False
         sr = self.cp0[12]
         if (sr & 0x1) and (sr & 0x6) == 0:
-            ips = self.cp0[13] & (((sr >> 8) & 0xFF) << 8) & 0x7C00
+            ips = self.cp0[13] & (((sr >> 8) & 0xFF) << 8) & 0xFF00
             if ips:
-                self.cp0[14] = (self.pc & 0x1FFFFFFF) | 0x80000000
-                self.cp0[13] = self.cp0[13] & ~0x7C
+                # EPC holds the interrupted virtual PC (or the branch when the
+                # exception happened in a delay slot) and BD marks the latter.
+                delay = bool(getattr(self, "_in_delay_slot", False))
+                self.cp0[14] = ((self.pc - 4) & 0xFFFFFFFF) if delay else self.pc
+                self.cp0[13] = (self.cp0[13] & ~ips & ~0x80000000) | (0x80000000 if delay else 0)
                 self.cp0[12] = sr | 0x2
                 self.pc = 0xBFC00380 if sr & 0x00400000 else 0x80000180
                 self.next_pc = (self.pc + 4) & 0xFFFFFFFF
+                self._in_delay_slot = False
                 if ips & 0x4000:  # VI vsync is edge-generated: auto-ack
                     self.mi_regs[2] &= ~0x08
                     self._mi_update()
@@ -10104,17 +10314,27 @@ class Nintendo64:
         self._irq_eval()
 
     def _sp_dma_run(self, to_sp):
+        # SP_RD_LEN / SP_WR_LEN: [11:0] length-1, [19:12] count-1,
+        # [31:20] skip. Each transfer advances both pointers by length+skip.
+        reg = self.sp_regs[2 if to_sp else 3]
+        length = (reg & 0x0FFF) + 1
+        count = ((reg >> 12) & 0xFF) + 1
+        skip = (reg >> 20) & 0x0FFF
         mem = self.sp_regs[0] & 0x1FFF
         dram = self.sp_regs[1] & 0x1FFFF8
-        ln = ((self.sp_regs[2 if to_sp else 3] & 0xFFF) | 0x1000) + 1
-        dmem = self.sp_dmem if mem < 0x1000 else self.sp_imem
-        off = mem & 0xFFF
-        n = min(ln, len(dmem) - off, len(self.rdram) - dram)
-        if n > 0:
-            if to_sp:
-                dmem[off:off + n] = self.rdram[dram:dram + n]
-            else:
-                self.rdram[dram:dram + n] = dmem[off:off + n]
+        for _ in range(count):
+            dmem = self.sp_dmem if mem < 0x1000 else self.sp_imem
+            off = mem & 0x0FFF
+            n = min(length, len(dmem) - off, max(0, len(self.rdram) - dram))
+            if n > 0:
+                if to_sp:
+                    dmem[off:off + n] = self.rdram[dram:dram + n]
+                else:
+                    self.rdram[dram:dram + n] = dmem[off:off + n]
+            # Only the initial DRAM address is 8-byte aligned; the stride
+            # length+skip is not, so don't re-align intermediate addresses.
+            mem = (mem + length + skip) & 0x1FFF
+            dram = (dram + length + skip) & 0xFFFFFFFF
 
     def _u32(self, p):
         if p + 4 <= len(self.rdram):
@@ -10177,7 +10397,7 @@ class Nintendo64:
             w0 = int.from_bytes(rdram[pc:pc + 4], "big")
             w1 = int.from_bytes(rdram[pc + 4:pc + 8], "big")
             op = w0 >> 24
-            if op in (0xB8, 0xDF, 0xD7):  # G_ENDDL / G_RET (0xB8 = F3DEX, 0xDF = F3DEX2)
+            if op in (0xB8, 0xDF):  # G_ENDDL (0xB8 = F3DEX, 0xDF = F3DEX2; 0xD7 is G_TEXTURE)
                 if dl_stack:
                     pc = dl_stack.pop() - 8
                 else:
@@ -10350,12 +10570,17 @@ class Nintendo64:
             return
         if 0x04300000 <= p < 0x04300010:
             idx = (p >> 2) & 3
-            if idx == 0:  # MI_INIT_MODE
-                if val & 0x0200:  # ClrDPInt
-                    self.mi_regs[2] &= ~0x20
-                if val & 0x0100:  # SetDPInt
-                    self.mi_regs[2] |= 0x20
-                self.mi_regs[0] = val
+            if idx == 0:  # MI_INIT_MODE / MI_MODE_REG
+                mode = self.mi_regs[0]
+                mode = (mode & ~0x7F) | (val & 0x7F)  # init length
+                if val & 0x0080: mode &= ~0x0080     # ClrInit
+                if val & 0x0100: mode |= 0x0080      # SetInit
+                if val & 0x0200: mode &= ~0x0100     # ClrEbus
+                if val & 0x0400: mode |= 0x0100      # SetEbus
+                if val & 0x0800: self.mi_regs[2] &= ~0x20  # ClrDPInt
+                if val & 0x1000: mode &= ~0x0200     # ClrRDRAM
+                if val & 0x2000: mode |= 0x0200      # SetRDRAM
+                self.mi_regs[0] = mode
             elif idx == 3:  # MI_INTR_MASK: clear/set pairs (SP..DP)
                 m = self.mi_regs[3]
                 for bit in range(6):
@@ -10376,26 +10601,29 @@ class Nintendo64:
                 self.sp_regs[idx] = val
                 if idx >= 2:  # length write triggers the DMA
                     self._sp_dma_run(idx == 2)
-            elif idx == 4:  # SP_STATUS set/clear pairs (MAME layout)
+            elif idx == 4:  # SP_STATUS: official set/clear write-bit layout
                 st = self.sp_regs[4]
-                if val & 0x00000001: st &= ~0x0001   # ClrHalt -> run pending task
-                if val & 0x00000002: st |= 0x0001    # SetHalt
-                if val & 0x00000004: st &= ~0x0002   # ClrBroke
-                if val & 0x00000008: st |= 0x0002    # SetBroke
-                if val & 0x00000010: st &= ~0x0004   # ClrDmaBusy
-                if val & 0x00000020: st |= 0x0004    # SetDmaBusy
-                if val & 0x00000040: st &= ~0x0008; self.mi_regs[2] &= ~0x01
-                if val & 0x00000080: st |= 0x0008;   # SetDmaFull
-                if val & 0x00000100: st &= ~0x0010
-                if val & 0x00000200: st |= 0x0010
-                if val & 0x00000400: st &= ~0x0020
-                if val & 0x00000800: st |= 0x0020
-                if val & 0x00001000: st &= ~0x0040
-                if val & 0x00002000:
-                    st |= 0x0040
-                    self.mi_regs[2] |= 0x01
-                self.sp_regs[4] = st & 0xFFFF
-                if val & 0x00000001:
+                # Writing both set and clear bits for one flag leaves it alone.
+                if bool(val & 0x0001) != bool(val & 0x0002):
+                    st = (st & ~0x0001) | (0x0001 if val & 0x0002 else 0)
+                if val & 0x0004:
+                    st &= ~0x0002                    # ClrBroke
+                if bool(val & 0x0008) != bool(val & 0x0010):
+                    self.mi_regs[2] = (self.mi_regs[2] & ~0x01) | (0x01 if val & 0x0010 else 0)
+                if bool(val & 0x0020) != bool(val & 0x0040):
+                    st = (st & ~0x0020) | (0x0020 if val & 0x0040 else 0)
+                if bool(val & 0x0080) != bool(val & 0x0100):
+                    st = (st & ~0x0040) | (0x0040 if val & 0x0100 else 0)
+                for sig in range(8):
+                    clear = 0x200 << (2 * sig)
+                    setbit = 0x400 << (2 * sig)
+                    if bool(val & clear) != bool(val & setbit):
+                        flag = 0x80 << sig
+                        st = (st & ~flag) | (flag if val & setbit else 0)
+                self.sp_regs[4] = st & 0x7FFF
+                self._mi_update()
+                self._irq_eval()
+                if val & 0x0001:                     # ClrHalt -> run pending task
                     self._rsp_task_start()
             return
         if 0x04100000 <= p < 0x04100020:
@@ -10429,6 +10657,13 @@ class Nintendo64:
         if 0x04500000 <= p < 0x04500020:
             idx = (p >> 2) & 7
             self.ai_regs[idx] = val
+            if idx == 3:  # AI_STATUS: any write acknowledges the AI interrupt
+                self.ai_regs[idx] = 0
+                self.mi_regs[2] &= ~0x04
+                self._ai_full = False
+                self._mi_update()
+                self._irq_eval()
+                return
             if idx == 1 and val >= 4:
                 # AI streams raw 16-bit stereo PCM from RDRAM at AI_DRAM_ADDR;
                 # DAC frequency = VI clock / (AI_DACRATE + 1).
@@ -10436,12 +10671,14 @@ class Nintendo64:
                 ln = min(val, len(self.rdram) - addr)
                 if ln > 16:
                     pcm = np.frombuffer(bytes(self.rdram[addr:addr + ln]), dtype="<u2")
-                    dac = self.ai_regs[2]
+                    dac = self.ai_regs[4]  # AI_DACRATE_REG (AI_CONTROL is idx 2)
                     rate = 48681812.0 / (dac + 1) if dac else 44100.0
                     rate = min(max(rate, 8000.0), 96000.0)
                     self.apu.push_n64(pcm, rate)
-            if idx in (0, 1) and val:  # AI length write: DMA completes, IRQ audio thread
+                # Only the length register starts a DMA; writing the address
+                # alone must not raise a spurious audio IRQ.
                 self.mi_regs[2] |= 0x04
+                self._ai_full = True
                 self._mi_update()
                 self._irq_eval()
             return
@@ -10464,6 +10701,10 @@ class Nintendo64:
             return
         if 0x04800000 <= p < 0x04800020:
             idx = (p >> 2) & 7
+            if idx == 6:  # SI_STATUS: any write acknowledges the SI interrupt
+                self.si_regs[idx] = val & ~0x1000
+                self._si_clear_irq()
+                return
             self.si_regs[idx] = val
             if idx == 1:  # SI_PIF_ADDR_RD64B -> Populate Joybus controller 1 state
                 dram_a = self.si_regs[0] & 0x007FFFF8
@@ -10479,14 +10720,17 @@ class Nintendo64:
                 self.pif_ram[4:8] = (n64_btn << 16).to_bytes(4, "big")
                 if dram_a + 64 <= len(self.rdram):
                     self.rdram[dram_a:dram_a + 64] = self.pif_ram[:64]
+                self._si_raise_irq()
             elif idx == 4:  # SI_PIF_ADDR_WR64B
                 dram_a = self.si_regs[0] & 0x007FFFF8
                 if dram_a + 64 <= len(self.rdram):
                     self.pif_ram[:64] = self.rdram[dram_a:dram_a + 64]
+                self._si_raise_irq()
             return
         if 0x1FC007C0 <= p < 0x1FC00800:
             o = p - 0x1FC007C0
             self.pif_ram[o:o + 4] = val.to_bytes(4, "big")
+            self._si_raise_irq()
 
     def read8(self, vaddr):
         p = vaddr & 0x1FFFFFFF
@@ -10639,7 +10883,8 @@ class Nintendo64:
                 elif rd == 12:
                     self._irq_eval()
                 elif rd == 13:
-                    self.cp0[13] = (g[rt] & 0x0300) | (self.cp0[13] & 0x7C00)
+                    # Only Cause.IP1/IP0 are writable from software.
+                    self.cp0[13] = (g[rt] & 0x0300) | (self.cp0[13] & 0xFF00)
                     self._irq_eval()
                 elif rd == 14 or rd == 30:
                     self._irq_eval()
@@ -10648,6 +10893,7 @@ class Nintendo64:
                 self.cp0[12] = sr0 & ~0x00000006
                 self.pc = self.cp0[30] if sr0 & 0x4 else self.cp0[14]
                 self.next_pc = (self.pc + 4) & 0xFFFFFFFF
+                self._in_delay_slot = False
                 self._irq_eval()
                 return
         elif op in (0x14, 0x15, 0x16, 0x17):  # BEQL, BNEL, BLEZL, BGTZL
@@ -10693,17 +10939,16 @@ class Nintendo64:
             self.write32((a + 4) & 0xFFFFFFFF, self.fpr[(rt & 0x1E) | 1])
         elif op == 0x2F:                                                       # CACHE
             pass
-        elif op in (0x14, 0x15):                                               # SDL / SDR
+        elif op in (0x2C, 0x2D):                                               # SDL / SDR
             a = (g[rs] + simm) & 0xFFFFFFFF
             v = g[rt]
-            if op == 0x14:                                                     # SDL stores high bytes first
-                off = a & 7
+            off = a & 7
+            if op == 0x2C:                                                     # SDL: high bytes first
                 for i in range(8 - off):
                     self.write8((a & ~7) + off + i, (v >> (56 - 8 * i)) & 0xFF)
-            else:                                                              # SDR: low bytes at aligned end
-                off = a & 7
+            else:                                                              # SDR: low byte at effective address
                 for i in range(off + 1):
-                    self.write8((a & ~7) + i, (v >> (56 - 8 * (off - i))) & 0xFF)
+                    self.write8((a & ~7) + i, (v >> (8 * (off - i))) & 0xFF)
         elif op in (0x1A, 0x1B):                                               # LDL / LDR
             a = (g[rs] + simm) & 0xFFFFFFFF
             off = a & 7
@@ -10762,6 +11007,13 @@ class Nintendo64:
             self._opmiss(ins)
 
         g[0] = 0
+        # Remember that the *next* instruction executes in a branch delay slot
+        # so exceptions can set Cause.BD and point EPC at the branch.
+        self._in_delay_slot = bool(
+            op in (0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                   0x14, 0x15, 0x16, 0x17)
+            or (op == 0x00 and fn in (0x08, 0x09))
+            or (op == 0x11 and rs == 0x08))
         self.pc = cur_next
         self.next_pc = target_next
 
@@ -10852,12 +11104,25 @@ class Nintendo64:
     def capture_state(self):
         return {
             "gpr": list(self.gpr), "cp0": list(self.cp0), "hi": self.hi, "lo": self.lo,
+            "fpr": list(self.fpr), "fcsr": self.fcsr,
             "pc": self.pc, "next_pc": self.next_pc,
+            "irq_active": self._irq_active, "in_delay_slot": self._in_delay_slot,
+            "ai_full": self._ai_full, "tick_div": self._tick_div,
             "vi": list(self.vi_regs), "pi": list(self.pi_regs),
             "ai": list(self.ai_regs), "si": list(self.si_regs), "mi": list(self.mi_regs),
+            "sp": list(self.sp_regs), "dp": list(self.dp_regs), "dp_status": self.dp_status,
             "rdram_z": zlib.compress(bytes(self.rdram), 1),
             "sp_dmem": bytes(self.sp_dmem), "sp_imem": bytes(self.sp_imem),
-            "pif_ram": bytes(self.pif_ram),
+            "pif_ram": bytes(self.pif_ram), "sram": bytes(self.sram),
+            "rsp_fb": self._rsp_fb.copy(), "zbuf": self._zbuf.copy(),
+            "rsp": {
+                "mv": list(self._rsp_mv), "proj": list(self._rsp_proj),
+                "comb": list(self._rsp_comb),
+                "mv_stack": [list(m) for m in self._rsp_mv_stack],
+                "vbuf": dict(self._rsp_vbuf), "dirty": self._rsp_dirty,
+                "budget": self._rsp_budget, "view_scale": self._rsp_view_scale,
+            },
+            "rsp_cmds": self.rsp_cmds, "rsp_tris": self.rsp_tris,
             "buttons": self.buttons, "frames": self.frames,
             "frame_rgba": self.frame_rgba.copy(),
         }
@@ -10867,8 +11132,15 @@ class Nintendo64:
         self.cp0[:] = st["cp0"]
         self.hi = st["hi"]
         self.lo = st["lo"]
+        if "fpr" in st:
+            self.fpr[:] = st["fpr"]
+        self.fcsr = st.get("fcsr", 0)
         self.pc = st["pc"]
         self.next_pc = st["next_pc"]
+        self._irq_active = st.get("irq_active", False)
+        self._in_delay_slot = st.get("in_delay_slot", False)
+        self._ai_full = st.get("ai_full", False)
+        self._tick_div = st.get("tick_div", 0)
         self.vi_regs[:] = st["vi"]
         if "pi" in st:
             self.pi_regs[:] = st["pi"]
@@ -10878,6 +11150,11 @@ class Nintendo64:
             self.si_regs[:] = st["si"]
         if "mi" in st:
             self.mi_regs[:] = st["mi"]
+        if "sp" in st:
+            self.sp_regs[:] = st["sp"]
+        if "dp" in st:
+            self.dp_regs[:] = st["dp"]
+        self.dp_status = st.get("dp_status", self.dp_status)
         if "rdram_z" in st:
             self.rdram[:] = zlib.decompress(st["rdram_z"])
         elif "rdram" in st:
@@ -10888,6 +11165,24 @@ class Nintendo64:
             self.sp_imem[:] = st["sp_imem"]
         if "pif_ram" in st:
             self.pif_ram[:] = st["pif_ram"]
+        if "sram" in st:
+            self.sram[:] = st["sram"]
+        if "rsp_fb" in st:
+            self._rsp_fb[:] = st["rsp_fb"]
+        if "zbuf" in st:
+            self._zbuf[:] = st["zbuf"]
+        rsp = st.get("rsp")
+        if rsp:
+            self._rsp_mv = list(rsp.get("mv", self._rsp_mv))
+            self._rsp_proj = list(rsp.get("proj", self._rsp_proj))
+            self._rsp_comb = list(rsp.get("comb", self._rsp_comb))
+            self._rsp_mv_stack = [list(m) for m in rsp.get("mv_stack", self._rsp_mv_stack)]
+            self._rsp_vbuf = dict(rsp.get("vbuf", self._rsp_vbuf))
+            self._rsp_dirty = rsp.get("dirty", self._rsp_dirty)
+            self._rsp_budget = rsp.get("budget", self._rsp_budget)
+            self._rsp_view_scale = rsp.get("view_scale", self._rsp_view_scale)
+        self.rsp_cmds = st.get("rsp_cmds", self.rsp_cmds)
+        self.rsp_tris = st.get("rsp_tris", self.rsp_tris)
         self.buttons = st.get("buttons", 0)
         self.frames = st.get("frames", self.frames)
         if "frame_rgba" in st:
